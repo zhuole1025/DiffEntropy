@@ -1,3 +1,4 @@
+from hmac import new
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -62,10 +63,25 @@ class JointAttnProcessorTokenMerge:
         query = attn.to_q(hidden_states)
         key = attn.to_k(hidden_states)
         value = attn.to_v(hidden_states)
-        
-        if timestep[0].item() > 1000:
+        print(timestep, key.shape, query.shape, value.shape)
+        if timestep[0].item() > 500:
             # reshape key and value into: (B, H, W, D)
             B, L, D = key.size()
+
+            # key = key.view(B, L, D).permute(0, 2, 1)
+            # value = value.view(B, L, D).permute(0, 2, 1)
+            # L1 = int(0.25*L)
+            # newkey = torch.empty(B, D, L1).to(key.device)
+            # newvalue = torch.empty(B, D, L1).to(value.device)
+            # indices = torch.randperm(L)[:L1] 
+            # newkey[:, :] = key[:, :, indices]
+            # newvalue[:, :] = value[:, :, indices]
+            # newkey = newkey.view(B, D, L1).permute(0, 2, 1)
+            # newvalue = newvalue.view(B, D,L1).permute(0, 2, 1)
+            # key = newkey
+            # value = newvalue
+
+
             H = W = int(L ** 0.5)
             key = key.view(B, H, W, D).permute(0, 3, 1, 2)
             value = value.view(B, H, W, D).permute(0, 3, 1, 2)
@@ -77,7 +93,7 @@ class JointAttnProcessorTokenMerge:
             # reshape key and value back to: (B, L/4, D)
             key = key.permute(0, 2, 3, 1).contiguous().view(B, -1, D)
             value = value.permute(0, 2, 3, 1).contiguous().view(B, -1, D)
-        
+    
         # `context` projections.
         encoder_hidden_states_query_proj = attn.add_q_proj(encoder_hidden_states)
         encoder_hidden_states_key_proj = attn.add_k_proj(encoder_hidden_states)

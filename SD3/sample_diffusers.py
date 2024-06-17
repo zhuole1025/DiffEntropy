@@ -1,4 +1,5 @@
 import os
+import time
 import torch
 
 from transformers import (
@@ -20,8 +21,8 @@ torch_dtype = torch.float16
 h = 1280
 w = 1280
 guidance_scale = 7.0
-prompt = "a photo of a cat holding a sign that says hello world"
-ckpt_path = "/home/pgao/zl/zl/.cache/huggingface/hub/models--stabilityai--stable-diffusion-3-medium-diffusers/snapshots/b1148b4028b9ec56ebd36444c193d56aeff7ab56"
+prompt = "a photo of a cat holding a sign that says hello Le!"
+ckpt_path = "/home/yliao/.cache/huggingface/hub/models--stabilityai--stable-diffusion-3-medium-diffusers/snapshots/b1148b4028b9ec56ebd36444c193d56aeff7ab56"
 
 transformer = SD3Transformer2DModelTokenMerge.from_pretrained(ckpt_path, subfolder="transformer")
 scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(ckpt_path, subfolder="scheduler")
@@ -39,6 +40,8 @@ text_encoder.to(torch_dtype)
 text_encoder_2.to(torch_dtype)
 text_encoder_3.to(torch_dtype)
 
+print(transformer)
+
 # pipe = StableDiffusion3Pipeline.from_pretrained(ckpt_path, torch_dtype=torch.float16)
 pipe = StableDiffusion3Pipeline(
     transformer=transformer,
@@ -52,19 +55,22 @@ pipe = StableDiffusion3Pipeline(
     tokenizer_3=tokenizer_3,
 )
 pipe.to("cuda")
+steps = 50
 
 with {
     "bf16": torch.cuda.amp.autocast(dtype=torch.bfloat16),
     "fp16": torch.cuda.amp.autocast(dtype=torch.float16),
 }["fp16"]:
+    t1 = time.time()
     image = pipe(
         prompt=prompt,
         negative_prompt="",
-        num_inference_steps=30,
+        num_inference_steps=steps,
         height=h,
         width=w,
         guidance_scale=guidance_scale,
     ).images[0]
+    print("Running time is: ", time.time() - t1)
 
 os.makedirs("samples", exist_ok=True)
-image.save(f'samples/{h}x{w}_gs{guidance_scale}_{prompt.replace(" ", "_")}.png')
+image.save(f'samples/{h}x{w}_gs{guidance_scale}_{prompt.replace(" ", "_")}_{steps}.png')
