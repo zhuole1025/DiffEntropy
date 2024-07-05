@@ -30,6 +30,77 @@ def modulate(x, scale):
 
 
 #############################################################################
+#                 Token Drop Router for K and V Token in DIT                #
+#############################################################################
+
+class TDRouter(torch.nn.Module):
+    def __init__(self, dim: int, cond_dim: int, threshold: float = 0.75):
+        """
+        Initialize the TDRouter layer.
+
+        Args:
+            dim (int): The dimension of the input tensor.
+            cond_dim (int): The dimension of the conditional tensor.
+            threshold (float): The threshold for the router, determing the ratio of droped tokens.
+
+        Attributes:
+            weight (nn.Parameter): Learnable router parameter.
+
+        """
+        super().__init__()
+        self.threshold = threshold
+        self.fc = ColumnParallelLinear(
+            dim,
+            1,
+            bias=True,
+            gather_output=False,
+            init_method=nn.init.ones_,
+        )
+        self.cond_fc = ColumnParallelLinear(
+            cond_dim,
+            dim,
+            bias=True,
+            gather_output=False,
+            init_method=nn.init.xavier_uniform_,
+        )
+
+    def forward(self, key, value, mask, cond):
+        """
+        Forward pass through the TDRouter layer.
+
+        Args:
+            key (torch.Tensor): The input key tensor.
+            value (torch.Tensor): The input value tensor.
+            mask (torch.Tensor): The input mask tensor.
+            cond (torch.Tensor): The conditional input tensor.
+
+        Returns:
+            torch.Tensor: The output tensor after applying TDRouter.
+
+        """
+        
+        B, L, H, D = key.size() # (batch, token length, head, dim)
+        key = key.view(key.size(0), key.size(1), -1) # (batch, token length, feature)
+        value = value.view(value.size(0), value.size(1), -1) # (batch, token length, feature)
+        
+        cond = self.cond_fc(cond) # (batch, feature)
+        key = key + cond.unsqueeze(1)  # (batch, 1, feature) + (batch, token length, feature)
+
+        _mask = self.fc(key).squeeze(-1) # (batch, token length)
+        _softmax = F.softmax(_mask, dim=-1)
+        _, indices = _softmax.topk(int((1-self.threshold)* L), dim=-1, largest=True, sorted=True)
+
+        dropped_key = torch.gather(key, 1, indices.unsqueeze(-1).expand(-1, -1, key.size(-1)))
+        dropped_value = torch.gather(value, 1, indices.unsqueeze(-1).expand(-1, -1, value.size(-1)))
+        dropped_mask = torch.gather(mask, 1, indices)
+        
+        dropped_key = dropped_key.view(B, -1, H, D)
+        dropped_value = dropped_value.view(B, -1, H, D)
+        
+        return dropped_key, dropped_value, dropped_mask
+    
+        
+#############################################################################
 #             Embedding Layers for Timesteps and Class Labels               #
 #############################################################################
 
@@ -218,6 +289,8 @@ class Attention(nn.Module):
         else:
             self.q_norm = self.k_norm = nn.Identity()
             self.ky_norm = nn.Identity()
+            
+        self.router = TDRouter(self.n_kv_heads * self.head_dim, min(dim, 1024), threshold=0.75)
 
         # for proportional attention computation
         self.base_seqlen = None
@@ -282,7 +355,7 @@ class Attention(nn.Module):
             return x_out.type_as(x_in)
 
     # copied from huggingface modeling_llama.py
-    def _upad_input(self, query_layer, key_layer, value_layer, attention_mask, query_length):
+    def _upad_input(self, query_layer, key_layer, value_layer, query_mask, key_mask, query_length):
         def _get_unpad_data(attention_mask):
             seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
             indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
@@ -294,7 +367,7 @@ class Attention(nn.Module):
                 max_seqlen_in_batch,
             )
 
-        indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(attention_mask)
+        indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(key_mask)
         batch_size, kv_seq_len, num_key_value_heads, head_dim = key_layer.shape
 
         key_layer = index_first_axis(
@@ -322,8 +395,8 @@ class Attention(nn.Module):
             query_layer = query_layer.squeeze(1)
         else:
             # The -q_len: slice assumes left padding.
-            attention_mask = attention_mask[:, -query_length:]
-            query_layer, indices_q, cu_seqlens_q, max_seqlen_in_batch_q = unpad_input(query_layer, attention_mask)
+            query_mask = query_mask[:, -query_length:]
+            query_layer, indices_q, cu_seqlens_q, max_seqlen_in_batch_q = unpad_input(query_layer, query_mask)
 
         return (
             query_layer,
@@ -337,16 +410,17 @@ class Attention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        x_mask: torch.Tensor,
+        q_mask: torch.Tensor,
         freqs_cis: torch.Tensor,
         y: torch.Tensor,
         y_mask: torch.Tensor,
+        adaln_input: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
 
         Args:
             x:
-            x_mask:
+            q_mask:
             freqs_cis:
             y:
             y_mask:
@@ -357,6 +431,7 @@ class Attention(nn.Module):
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
         dtype = xq.dtype
+        k_mask = q_mask.clone()
 
         xq = self.q_norm(xq)
         xk = self.k_norm(xk)
@@ -369,12 +444,14 @@ class Attention(nn.Module):
         xk = Attention.apply_rotary_emb(xk, freqs_cis=freqs_cis)
 
         xq, xk = xq.to(dtype), xk.to(dtype)
+        
+        dropped_xk, dropped_xv, dropped_k_mask = self.router(xk, xv, k_mask, adaln_input)
 
         if self.proportional_attn:
             softmax_scale = math.sqrt(math.log(seqlen, self.base_seqlen) / self.head_dim)
         else:
             softmax_scale = math.sqrt(1 / self.head_dim)
-
+        breakpoint()
         if dtype in [torch.float16, torch.bfloat16]:
             # begin var_len flash attn
             (
@@ -384,7 +461,7 @@ class Attention(nn.Module):
                 indices_q,
                 cu_seq_lens,
                 max_seq_lens,
-            ) = self._upad_input(xq, xk, xv, x_mask, seqlen)
+            ) = self._upad_input(xq, dropped_xk, dropped_xv, q_mask, dropped_k_mask, seqlen)
 
             cu_seqlens_q, cu_seqlens_k = cu_seq_lens
             max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
@@ -405,17 +482,21 @@ class Attention(nn.Module):
             # end var_len_flash_attn
 
         else:
+            n_rep = self.n_local_heads // self.n_local_kv_heads
+            if n_rep >= 1:
+                xk = xk.unsqueeze(3).repeat(1, 1, 1, n_rep, 1).flatten(2, 3)
+                xv = xv.unsqueeze(3).repeat(1, 1, 1, n_rep, 1).flatten(2, 3)
             output = (
                 F.scaled_dot_product_attention(
                     xq.permute(0, 2, 1, 3),
                     xk.permute(0, 2, 1, 3),
                     xv.permute(0, 2, 1, 3),
-                    attn_mask=x_mask.bool().view(bsz, 1, 1, seqlen).expand(-1, self.n_local_heads, seqlen, -1),
+                    attn_mask=q_mask.bool().view(bsz, 1, 1, seqlen).expand(-1, self.n_local_heads, seqlen, -1),
                     scale=softmax_scale,
                 )
                 .permute(0, 2, 1, 3)
                 .to(dtype)
-            )
+        )
 
         if hasattr(self, "wk_y"):
             yk = self.ky_norm(self.wk_y(y)).view(bsz, -1, self.n_local_kv_heads, self.head_dim)
@@ -593,7 +674,7 @@ class TransformerBlock(nn.Module):
         """
         if adaln_input is not None:
             scale_msa, gate_msa, scale_mlp, gate_mlp = self.adaLN_modulation(adaln_input).chunk(4, dim=1)
-
+            
             x = x + gate_msa.unsqueeze(1).tanh() * self.attention_norm2(
                 self.attention(
                     modulate(self.attention_norm1(x), scale_msa),
@@ -601,6 +682,7 @@ class TransformerBlock(nn.Module):
                     freqs_cis,
                     self.attention_y_norm(y),
                     y_mask,
+                    adaln_input,
                 )
             )
             x = x + gate_mlp.unsqueeze(1).tanh() * self.ffn_norm2(
@@ -617,6 +699,7 @@ class TransformerBlock(nn.Module):
                     freqs_cis,
                     self.attention_y_norm(y),
                     y_mask,
+                    adaln_input,
                 )
             )
             x = x + self.ffn_norm2(self.feed_forward(self.ffn_norm1(x)))
@@ -849,7 +932,7 @@ class NextDiT(nn.Module):
         cap_feats_pool = cap_feats_pool.to(cap_feats)
         cap_emb = self.cap_embedder(cap_feats_pool)
         adaln_input = t + cap_emb
-
+        
         cap_mask = cap_mask.bool()
         for layer in self.layers:
             x = layer(x, mask, freqs_cis, cap_feats, cap_mask, adaln_input=adaln_input)
