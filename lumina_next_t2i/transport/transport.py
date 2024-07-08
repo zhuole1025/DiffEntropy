@@ -117,7 +117,7 @@ class Transport:
             raise ValueError(f"Unknown snr type: {self.snr_type}")
         t = t.to(x1[0])
         return t, x0, x1
-
+    
     def training_losses(self, model, x1, model_kwargs=None):
         """Loss for training the score model
         Args:
@@ -150,6 +150,48 @@ class Transport:
         else:
             raise NotImplementedError
 
+        terms["loss"] = terms["task_loss"]
+        terms["task_loss"] = terms["task_loss"].clone().detach()
+        return terms
+
+    def td_training_losses(self, model, teacher_model, x1, model_kwargs=None):
+        """Loss for training the score model with token drop
+        Args:
+        - model: backbone model; could be score, noise, or velocity
+        - x1: datapoint
+        - model_kwargs: additional arguments for the model
+        """
+        if model_kwargs == None:
+            model_kwargs = {}
+        t, x0, x1 = self.sample(x1)
+        t, xt, ut = self.path_sampler.plan(t, x0, x1)
+        model_output = model(xt, t, **model_kwargs)
+        B = len(x0)
+
+        # compute losses
+        # 1. denoising loss
+        terms = {}
+        # terms['pred'] = model_output
+        if self.model_type == ModelType.VELOCITY:
+            if isinstance(x1, (list, tuple)):
+                assert len(model_output) == len(ut) == len(x1)
+                for i in range(B):
+                    assert (
+                        model_output[i].shape == ut[i].shape == x1[i].shape
+                    ), f"{model_output[i].shape} {ut[i].shape} {x1[i].shape}"
+                terms["task_loss"] = th.stack(
+                    [((ut[i] - model_output[i]) ** 2).mean() for i in range(B)],
+                    dim=0,
+                )
+            else:
+                terms["task_loss"] = mean_flat(((model_output - ut) ** 2))
+        else:
+            raise NotImplementedError
+        
+        # 2. entropy loss
+        
+        # 3. mse loss
+        
         terms["loss"] = terms["task_loss"]
         terms["task_loss"] = terms["task_loss"].clone().detach()
         return terms

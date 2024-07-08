@@ -451,7 +451,7 @@ class Attention(nn.Module):
             softmax_scale = math.sqrt(math.log(seqlen, self.base_seqlen) / self.head_dim)
         else:
             softmax_scale = math.sqrt(1 / self.head_dim)
-        breakpoint()
+        
         if dtype in [torch.float16, torch.bfloat16]:
             # begin var_len flash attn
             (
