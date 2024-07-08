@@ -1,9 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
-
 #############################################################################
 #                 Token Drop Router for K and V Token in DIT                #
 #############################################################################
