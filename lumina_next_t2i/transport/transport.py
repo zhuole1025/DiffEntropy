@@ -5,7 +5,7 @@ import torch as th
 
 from . import path
 from .integrators import ode, sde
-from .utils import mean_flat
+from .utils import mean_flat, token_entropy_loss
 
 
 class ModelType(enum.Enum):
@@ -168,6 +168,9 @@ class Transport:
         model_output = model(xt, t, **model_kwargs)
         B = len(x0) # x0: [B, C, H, W]
 
+        student_output, student_attn_dict = model(xt, t, **model_kwargs)
+        teacher_output, teacher_attn_dict = teacher_model(xt, t, **model_kwargs)
+
         # compute losses
         # 1. denoising loss
         terms = {}
@@ -188,11 +191,14 @@ class Transport:
         else:
             raise NotImplementedError
         
-        # 2. entropy loss
-        
-        # 3. mse loss
-        
-        terms["loss"] = terms["task_loss"]
+        # 2. token-level atten entropy loss
+        terms["entropy_loss"] = token_entropy_loss(student_attn_dict, teacher_attn_dict)
+
+        # 3. other loss constrain
+
+        # 4. total loss
+        terms["loss"] = terms["task_loss"] + terms["entropy_loss"]
+
         terms["task_loss"] = terms["task_loss"].clone().detach()
         return terms
 

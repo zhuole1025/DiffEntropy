@@ -1,4 +1,29 @@
+from re import L
 import torch as th
+
+def token_entropy_loss(student_attn_dict, teacher_attn_dict):
+    """
+        Entropy loss is to minimize the difference between the entropy of original token-level
+        attention logits distribution and merged token-level attention logits distribution.
+
+        Args:
+            student_attn_dict: {1: attention_logits, 2: attention_logits, 3: attention_logits.....}
+            teacher_attn_dict: {1: attention_logits, 2: attention_logits, 3: attention_logits.....}
+            # attention_logits.shape = (B,L,L)
+        Returns: batch_entropy_loss: (B,)
+    """
+    shape = None
+    for layer in student_attn_dict.keys():
+        shape = student_attn_dict[layer].shape
+        break
+    B,L,_ = shape
+    batch_entropy_loss = th.zeros(th.zeros((B,))).to(student_attn_dict[1].device)
+    for layer in student_attn_dict.keys():
+        s_entropy = th.log(1 + th.var(student_attn_dict[layer], dim=-1))
+        t_entropy = th.log(1 + th.var(teacher_attn_dict[layer], dim=-1))
+        batch_entropy_loss += th.mean((t_entropy - s_entropy)**2, dim=-1)
+
+    return batch_entropy_loss
 
 
 class EasyDict:
@@ -29,3 +54,4 @@ def log_state(state):
             result.append(f"{key}: {value}")
 
     return "\n".join(result)
+
