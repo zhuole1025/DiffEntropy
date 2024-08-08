@@ -215,6 +215,7 @@ class Attention(nn.Module):
         n_kv_heads: Optional[int],
         qk_norm: bool,
         y_dim: int,
+        use_router: bool = False,
     ):
         """
         Initialize the Attention module.
@@ -232,7 +233,7 @@ class Attention(nn.Module):
         self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = dim // n_heads
-
+        
         self.wq = ColumnParallelLinear(
             dim,
             n_heads * self.head_dim,
@@ -289,8 +290,10 @@ class Attention(nn.Module):
         else:
             self.q_norm = self.k_norm = nn.Identity()
             self.ky_norm = nn.Identity()
-            
-        self.router = TDRouter(self.n_kv_heads * self.head_dim, min(dim, 1024), threshold=0.75)
+        
+        self.use_router = use_router
+        if use_router:
+            self.router = TDRouter(self.n_kv_heads * self.head_dim, min(dim, 1024), threshold=0.75)
 
         # for proportional attention computation
         self.base_seqlen = None
@@ -415,6 +418,7 @@ class Attention(nn.Module):
         y: torch.Tensor,
         y_mask: torch.Tensor,
         adaln_input: Optional[torch.Tensor] = None,
+        return_attn: bool = False,
     ) -> torch.Tensor:
         """
 
@@ -445,7 +449,8 @@ class Attention(nn.Module):
 
         xq, xk = xq.to(dtype), xk.to(dtype)
         
-        dropped_xk, dropped_xv, dropped_k_mask = self.router(xk, xv, k_mask, adaln_input)
+        if self.use_router:
+            xk, xv, k_mask = self.router(xk, xv, k_mask, adaln_input)
 
         if self.proportional_attn:
             softmax_scale = math.sqrt(math.log(seqlen, self.base_seqlen) / self.head_dim)
@@ -461,7 +466,7 @@ class Attention(nn.Module):
                 indices_q,
                 cu_seq_lens,
                 max_seq_lens,
-            ) = self._upad_input(xq, dropped_xk, dropped_xv, q_mask, dropped_k_mask, seqlen)
+            ) = self._upad_input(xq, xk, xv, q_mask, k_mask, seqlen)
 
             cu_seqlens_q, cu_seqlens_k = cu_seq_lens
             max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
@@ -497,7 +502,7 @@ class Attention(nn.Module):
                 .permute(0, 2, 1, 3)
                 .to(dtype)
         )
-
+        
         if hasattr(self, "wk_y"):
             yk = self.ky_norm(self.wk_y(y)).view(bsz, -1, self.n_local_kv_heads, self.head_dim)
             yv = self.wv_y(y).view(bsz, -1, self.n_local_kv_heads, self.head_dim)
@@ -516,6 +521,17 @@ class Attention(nn.Module):
 
         output = output.flatten(-2)
 
+        if return_attn:
+            n_rep = self.n_local_heads // self.n_local_kv_heads
+            if n_rep >= 1:
+                xk = xk.unsqueeze(3).repeat(1, 1, 1, n_rep, 1).flatten(2, 3)
+                xv = xv.unsqueeze(3).repeat(1, 1, 1, n_rep, 1).flatten(2, 3)
+                
+            attn_weight = xq.permute(0, 2, 1, 3) @ xk.permute(0, 2, 1, 3).transpose(-2, -1) * softmax_scale
+            attn_weight = torch.softmax(attn_weight, dim=-1)
+            
+            return self.wo(output), attn_weight
+            
         return self.wo(output)
 
 
@@ -595,6 +611,7 @@ class TransformerBlock(nn.Module):
         norm_eps: float,
         qk_norm: bool,
         y_dim: int,
+        use_router: bool,
     ) -> None:
         """
         Initialize a TransformerBlock.
@@ -624,7 +641,7 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.dim = dim
         self.head_dim = dim // n_heads
-        self.attention = Attention(dim, n_heads, n_kv_heads, qk_norm, y_dim)
+        self.attention = Attention(dim, n_heads, n_kv_heads, qk_norm, y_dim, use_router)
         self.feed_forward = FeedForward(
             dim=dim,
             hidden_dim=4 * dim,
@@ -659,6 +676,7 @@ class TransformerBlock(nn.Module):
         y: torch.Tensor,
         y_mask: torch.Tensor,
         adaln_input: Optional[torch.Tensor] = None,
+        return_attn: bool = False,
     ):
         """
         Perform a forward pass through the TransformerBlock.
@@ -675,16 +693,21 @@ class TransformerBlock(nn.Module):
         if adaln_input is not None:
             scale_msa, gate_msa, scale_mlp, gate_mlp = self.adaLN_modulation(adaln_input).chunk(4, dim=1)
             
-            x = x + gate_msa.unsqueeze(1).tanh() * self.attention_norm2(
-                self.attention(
-                    modulate(self.attention_norm1(x), scale_msa),
-                    x_mask,
-                    freqs_cis,
-                    self.attention_y_norm(y),
-                    y_mask,
-                    adaln_input,
-                )
+            attn_output = self.attention(
+                modulate(self.attention_norm1(x), scale_msa),
+                x_mask,
+                freqs_cis,
+                self.attention_y_norm(y),
+                y_mask,
+                adaln_input,
+                return_attn,
             )
+            
+            if return_attn:
+                attn_output, attn_weight = attn_output
+                
+            x = x + gate_msa.unsqueeze(1).tanh() * self.attention_norm2(attn_output)
+            
             x = x + gate_mlp.unsqueeze(1).tanh() * self.ffn_norm2(
                 self.feed_forward(
                     modulate(self.ffn_norm1(x), scale_mlp),
@@ -692,18 +715,26 @@ class TransformerBlock(nn.Module):
             )
 
         else:
-            x = x + self.attention_norm2(
-                self.attention(
-                    self.attention_norm1(x),
-                    x_mask,
-                    freqs_cis,
-                    self.attention_y_norm(y),
-                    y_mask,
-                    adaln_input,
-                )
+            attn_output = self.attention(
+                self.attention_norm1(x),
+                x_mask,
+                freqs_cis,
+                self.attention_y_norm(y),
+                y_mask,
+                adaln_input,
+                return_attn,
             )
+            
+            if return_attn:
+                attn_output, attn_weight = attn_output
+                
+            x = x + self.attention_norm2(attn_output)
+            
             x = x + self.ffn_norm2(self.feed_forward(self.ffn_norm1(x)))
 
+        if return_attn:
+            return x, attn_weight
+        
         return x
 
 
@@ -765,6 +796,7 @@ class NextDiT(nn.Module):
         qk_norm: bool = False,
         cap_feat_dim: int = 5120,
         scale_factor: float = 1.0,
+        use_router: bool = False,
     ) -> None:
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -805,6 +837,7 @@ class NextDiT(nn.Module):
                     norm_eps,
                     qk_norm,
                     cap_feat_dim,
+                    use_router,
                 )
                 for layer_id in range(n_layers)
             ]
@@ -916,7 +949,7 @@ class NextDiT(nn.Module):
             freqs_cis = torch.stack(padded_freqs_cis, dim=0)
             return x_embed, mask, img_size, freqs_cis
 
-    def forward(self, x, t, cap_feats, cap_mask):
+    def forward(self, x, t, cap_feats, cap_mask, return_attn=False):
         """
         Forward pass of NextDiT.
         t: (N,) tensor of diffusion timesteps
@@ -934,9 +967,13 @@ class NextDiT(nn.Module):
         adaln_input = t + cap_emb
         
         cap_mask = cap_mask.bool()
+        attn_weights = []
         for layer in self.layers:
-            x = layer(x, mask, freqs_cis, cap_feats, cap_mask, adaln_input=adaln_input)
-
+            x = layer(x, mask, freqs_cis, cap_feats, cap_mask, adaln_input=adaln_input, return_attn=return_attn)
+            if return_attn:
+                x, attn_weight = x
+                attn_weights.append(attn_weight)
+        
         x = self.final_layer(x, adaln_input)
         x = self.unpatchify(x, img_size, return_tensor=x_is_tensor)
         if self.learn_sigma:
@@ -944,6 +981,11 @@ class NextDiT(nn.Module):
                 x, _ = x.chunk(2, dim=1)
             else:
                 x = [_.chunk(2, dim=0)[0] for _ in x]
+                
+        if return_attn:
+            attn_weights = torch.stack(attn_weights, dim=1)
+            return x, attn_weights
+        
         return x
 
     def forward_with_cfg(

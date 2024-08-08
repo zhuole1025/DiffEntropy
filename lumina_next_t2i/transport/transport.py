@@ -166,7 +166,7 @@ class Transport:
         t, x0, x1 = self.sample(x1)
         t, xt, ut = self.path_sampler.plan(t, x0, x1)
         model_output = model(xt, t, **model_kwargs)
-        B = len(x0)
+        B = len(x0) # x0: [B, C, H, W]
 
         # compute losses
         # 1. denoising loss

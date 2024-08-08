@@ -312,11 +312,22 @@ def main(args):
     print(f"text encoder: {type(text_encoder)}")
     cap_feat_dim = text_encoder.config.hidden_size
 
+    # Create teacher model:
+    assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
+    teacher = models.__dict__[args.model](
+        qk_norm=args.qk_norm,
+        cap_feat_dim=cap_feat_dim,
+        use_router=False,
+    )
+    logger.info(f"Teacher Parameters: {teacher.parameter_count():,}")
+    teacher_parallel_dim_dict = get_model_parallel_dim_dict(teacher)
+    
     # Create model:
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
     model = models.__dict__[args.model](
         qk_norm=args.qk_norm,
         cap_feat_dim=cap_feat_dim,
+        use_router=True,
     )
     logger.info(f"DiT Parameters: {model.parameter_count():,}")
     model_patch_size = model.patch_size
