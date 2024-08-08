@@ -320,7 +320,7 @@ def main(args):
         use_router=False,
     )
     logger.info(f"Teacher Parameters: {teacher.parameter_count():,}")
-    teacher_parallel_dim_dict = get_model_parallel_dim_dict(teacher)
+    teacher.requires_grad_(False)
     
     # Create model:
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
@@ -538,17 +538,17 @@ def main(args):
             cap_feats_mb = cap_feats[mb_st:mb_ed]
             cap_mask_mb = cap_mask[mb_st:mb_ed]
 
-            model_kwargs = dict(cap_feats=cap_feats_mb, cap_mask=cap_mask_mb)
+            model_kwargs = dict(cap_feats=cap_feats_mb, cap_mask=cap_mask_mb, return_attn=True)
             with {
                 "bf16": torch.cuda.amp.autocast(dtype=torch.bfloat16),
                 "fp16": torch.cuda.amp.autocast(dtype=torch.float16),
                 "fp32": contextlib.nullcontext(),
                 "tf32": contextlib.nullcontext(),
             }[args.precision]:
-                loss_dict = transport.training_losses(model, x_mb, model_kwargs)
+                loss_dict = transport.td_training_losses(model, teacher, x_mb, model_kwargs)
             loss = loss_dict["loss"].sum() / local_batch_size
             loss_item += loss.item()
-            with model.no_sync() if args.data_parallel in ["sdp", "hsdp"] and not last_mb else contextlib.nullcontext():
+            with model.no_sync() if args.data_parallel in ["sdp", "fsdp"] and not last_mb else contextlib.nullcontext():
                 loss.backward()
 
         grad_norm = calculate_l2_grad_norm(model, model_parallel_dim_dict)

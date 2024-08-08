@@ -19,7 +19,7 @@ mkdir -p results/"$exp_name"
 unset NCCL_IB_HCA
 # export TOKENIZERS_PARALLELISM=false
 
-CUDA_VISIBLE_DEVICES=1 MASTER_ADDR=localhost torchrun --nproc-per-node=1 --master_port 18181 train.py \
+CUDA_VISIBLE_DEVICES=7 MASTER_ADDR=localhost torchrun --nproc-per-node=1 --master_port 18181 train.py \
     --master_port 18181 \
     --model ${model} \
     --data_path ${train_data_root} \

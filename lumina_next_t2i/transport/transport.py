@@ -165,11 +165,11 @@ class Transport:
             model_kwargs = {}
         t, x0, x1 = self.sample(x1)
         t, xt, ut = self.path_sampler.plan(t, x0, x1)
-        model_output = model(xt, t, **model_kwargs)
         B = len(x0) # x0: [B, C, H, W]
 
-        student_output, student_attn_dict = model(xt, t, **model_kwargs)
-        teacher_output, teacher_attn_dict = teacher_model(xt, t, **model_kwargs)
+        student_output, student_attn = model(xt, t, **model_kwargs)
+        with th.no_grad():
+            teacher_output, teacher_attn = teacher_model(xt, t, **model_kwargs)
 
         # compute losses
         # 1. denoising loss
@@ -177,22 +177,25 @@ class Transport:
         # terms['pred'] = model_output
         if self.model_type == ModelType.VELOCITY:
             if isinstance(x1, (list, tuple)):
-                assert len(model_output) == len(ut) == len(x1)
+                assert len(student_output) == len(ut) == len(x1)
                 for i in range(B):
                     assert (
-                        model_output[i].shape == ut[i].shape == x1[i].shape
-                    ), f"{model_output[i].shape} {ut[i].shape} {x1[i].shape}"
+                        student_output[i].shape == ut[i].shape == x1[i].shape
+                    ), f"{student_output[i].shape} {ut[i].shape} {x1[i].shape}"
                 terms["task_loss"] = th.stack(
-                    [((ut[i] - model_output[i]) ** 2).mean() for i in range(B)],
+                    [((ut[i] - student_output[i]) ** 2).mean() for i in range(B)],
                     dim=0,
                 )
             else:
-                terms["task_loss"] = mean_flat(((model_output - ut) ** 2))
+                terms["task_loss"] = mean_flat(((student_output - ut) ** 2))
         else:
             raise NotImplementedError
         
         # 2. token-level atten entropy loss
-        terms["entropy_loss"] = token_entropy_loss(student_attn_dict, teacher_attn_dict)
+        B, N, L, _ = student_attn.shape
+        s_entropy = th.log(1 + th.var(student_attn, dim=-1))
+        t_entropy = th.log(1 + th.var(teacher_attn, dim=-1))
+        terms["entropy_loss"] = th.mean((t_entropy - s_entropy)**2, dim=-1)
 
         # 3. other loss constrain
 
