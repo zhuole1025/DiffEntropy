@@ -202,7 +202,7 @@ class Transport:
         terms["entropy_loss"] = mean_flat((t_entropy - s_entropy)**2)
 
         # 3. token-level mse loss
-        terms["mse_loss"] = mean_flat((teacher_attn - student_attn)**2)
+        terms["mse_loss"] = mean_flat((teacher_output - student_output)**2)
 
         # 4. total loss
         terms["loss"] = terms["entropy_loss"] + terms["mse_loss"] 
