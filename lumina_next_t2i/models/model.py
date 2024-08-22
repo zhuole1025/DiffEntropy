@@ -949,7 +949,7 @@ class NextDiT(nn.Module):
             freqs_cis = torch.stack(padded_freqs_cis, dim=0)
             return x_embed, mask, img_size, freqs_cis
 
-    def forward(self, x, t, cap_feats, cap_mask, return_attn=False):
+    def forward(self, x, t, cap_feats, cap_mask, return_attn=False, cur_stage=-1):
         """
         Forward pass of NextDiT.
         t: (N,) tensor of diffusion timesteps
@@ -967,12 +967,16 @@ class NextDiT(nn.Module):
         adaln_input = t + cap_emb
         
         cap_mask = cap_mask.bool()
-        attn_weights = []
-        for layer in self.layers:
-            x = layer(x, mask, freqs_cis, cap_feats, cap_mask, adaln_input=adaln_input, return_attn=return_attn)
+        for idx, layer in enumerate(self.layers[:cur_stage + 1]):
+            return_attn_layer = return_attn and idx == cur_stage
+            x = layer(x, mask, freqs_cis, cap_feats, cap_mask, adaln_input=adaln_input, return_attn=return_attn_layer)
+            if return_attn_layer:
+                x, attn_weights = x
+        
+        if cur_stage != -1:
             if return_attn:
-                x, attn_weight = x
-                attn_weights.append(attn_weight)
+                return x, attn_weights
+            return x
         
         x = self.final_layer(x, adaln_input)
         x = self.unpatchify(x, img_size, return_tensor=x_is_tensor)
@@ -983,7 +987,6 @@ class NextDiT(nn.Module):
                 x = [_.chunk(2, dim=0)[0] for _ in x]
                 
         if return_attn:
-            attn_weights = torch.stack(attn_weights, dim=1)
             return x, attn_weights
         
         return x

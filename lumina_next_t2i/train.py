@@ -320,6 +320,7 @@ def main(args):
         use_router=False,
     )
     logger.info(f"Teacher Parameters: {teacher.parameter_count():,}")
+    teacher.eval()
     teacher.requires_grad_(False)
     
     # Create model:
@@ -381,6 +382,7 @@ def main(args):
                 ),
                 map_location="cpu",
             )
+            _, _ = teacher.load_state_dict(state_dict, strict=False)    
             missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
             missing_keys_ema, unexpected_keys_ema = model_ema.load_state_dict(state_dict, strict=False)
             del state_dict
@@ -391,6 +393,7 @@ def main(args):
             logger.info(f"  Unexpeected keys: {unexpected_keys}")
     dist.barrier()
 
+    teacher = setup_fsdp_sync(teacher, args)
     model = setup_fsdp_sync(model, args)
     model_ema = setup_fsdp_sync(model_ema, args)
 
@@ -538,7 +541,7 @@ def main(args):
             cap_feats_mb = cap_feats[mb_st:mb_ed]
             cap_mask_mb = cap_mask[mb_st:mb_ed]
 
-            model_kwargs = dict(cap_feats=cap_feats_mb, cap_mask=cap_mask_mb, return_attn=True)
+            model_kwargs = dict(cap_feats=cap_feats_mb, cap_mask=cap_mask_mb, return_attn=True, cur_stage=transport.cur_stage)
             with {
                 "bf16": torch.cuda.amp.autocast(dtype=torch.bfloat16),
                 "fp16": torch.cuda.amp.autocast(dtype=torch.float16),
@@ -562,6 +565,11 @@ def main(args):
 
         opt.step()
         update_ema(model_ema, model)
+        
+        # Update training stage:
+        if (step + 1) % args.steps_per_stage == 0 and transport.cur_stage < len(model.layers):
+            logger.info(f"Updating training stage to {transport.cur_stage + 1}")
+            transport.update_stage()
 
         # Log loss values:
         running_loss += loss_item
@@ -727,6 +735,7 @@ if __name__ == "__main__":
         help="Randomly change the caption of a sample to a blank string with the given probability.",
     )
     parser.add_argument("--snr_type", type=str, default="uniform", choices=["uniform", "lognorm"])
+    parser.add_argument("--steps_per_stage", type=int, default=1000)
     args = parser.parse_args()
 
     main(args)

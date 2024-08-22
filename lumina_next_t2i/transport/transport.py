@@ -5,7 +5,7 @@ import torch as th
 
 from . import path
 from .integrators import ode, sde
-from .utils import mean_flat, token_entropy_loss
+from .utils import mean_flat
 
 
 class ModelType(enum.Enum):
@@ -58,6 +58,7 @@ class Transport:
         self.sample_eps = sample_eps
 
         self.snr_type = snr_type
+        self.cur_stage = 0
 
     def prior_logp(self, z):
         """
@@ -153,6 +154,9 @@ class Transport:
         terms["loss"] = terms["task_loss"]
         terms["task_loss"] = terms["task_loss"].clone().detach()
         return terms
+    
+    def update_stage(self):
+        self.cur_stage += 1
 
     def td_training_losses(self, model, teacher_model, x1, model_kwargs=None):
         """Loss for training the score model with token drop
@@ -166,7 +170,6 @@ class Transport:
         t, x0, x1 = self.sample(x1)
         t, xt, ut = self.path_sampler.plan(t, x0, x1)
         B = len(x0) # x0: [B, C, H, W]
-
         student_output, student_attn = model(xt, t, **model_kwargs)
         with th.no_grad():
             teacher_output, teacher_attn = teacher_model(xt, t, **model_kwargs)
@@ -175,7 +178,7 @@ class Transport:
         # 1. denoising loss
         terms = {}
         # terms['pred'] = model_output
-        if self.model_type == ModelType.VELOCITY:
+        if self.model_type == ModelType.VELOCITY and self.cur_stage == len(model.layers):
             if isinstance(x1, (list, tuple)):
                 assert len(student_output) == len(ut) == len(x1)
                 for i in range(B):
@@ -188,21 +191,23 @@ class Transport:
                 )
             else:
                 terms["task_loss"] = mean_flat(((student_output - ut) ** 2))
-        else:
-            raise NotImplementedError
         
         # 2. token-level atten entropy loss
         B, N, L, _ = student_attn.shape
-        s_entropy = th.log(1 + th.var(student_attn, dim=-1))
-        t_entropy = th.log(1 + th.var(teacher_attn, dim=-1))
-        terms["entropy_loss"] = th.mean((t_entropy - s_entropy)**2, dim=-1)
+        # s_entropy = th.log(1 + th.var(student_attn, dim=-1))
+        # t_entropy = th.log(1 + th.var(teacher_attn, dim=-1))
+        # terms["entropy_loss"] = mean_flat((t_entropy - s_entropy)**2)
+        s_entropy = -th.sum(student_attn * th.log(student_attn + 1e-9), dim=-1)
+        t_entropy = -th.sum(teacher_attn * th.log(teacher_attn + 1e-9), dim=-1)
+        terms["entropy_loss"] = mean_flat((t_entropy - s_entropy)**2)
 
-        # 3. other loss constrain
+        # 3. token-level mse loss
+        terms["mse_loss"] = mean_flat((teacher_attn - student_attn)**2)
 
         # 4. total loss
-        terms["loss"] = terms["task_loss"] + terms["entropy_loss"]
+        terms["loss"] = terms["entropy_loss"] + terms["mse_loss"] 
 
-        terms["task_loss"] = terms["task_loss"].clone().detach()
+        # terms["task_loss"] = terms["task_loss"].clone().detach()
         return terms
 
     def get_drift(self):

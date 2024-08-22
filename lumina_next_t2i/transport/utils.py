@@ -21,7 +21,7 @@ def log_state(state):
 
     sorted_state = dict(sorted(state.items()))
     for key, value in sorted_state.items():
-        # Check if the value is an instance of a class
+        # Check if the valuemean_flat is an instance of a class
         if "<object" in str(value) or "object at" in str(value):
             result.append(f"{key}: [{value.__class__.__name__}]")
         else:
