@@ -1,0 +1,5 @@
+META:
+  -
+    path: '/root/data/krea_2M.json'
+    type: 'image_text'
+    root: '/goosedata/images'
