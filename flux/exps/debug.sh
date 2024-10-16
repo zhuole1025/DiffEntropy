@@ -4,11 +4,11 @@ export HF_TOKEN="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"
 export HF_HOME="/data/huggingface"
 train_data_root='configs/data/2M.yaml'
 
-batch_size=8
+batch_size=16
 micro_batch_size=1
 lr=1e-5
 precision=bf16
-image_size=3072
+image_size=2048
 snr_type=lognorm
 
 exp_name=test

@@ -14,7 +14,7 @@ def expand_attn_mask(
     attn_mask: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Expand a mask so that the image is included.
+    Expand a mask so that the text mask is included.
     """
     bsz = attn_mask.shape[0]
     assert bsz == hidden_states.shape[0]
@@ -25,7 +25,7 @@ def expand_attn_mask(
     start_index = residual_seq_len - mask_seq_len
     expanded_mask[:, start_index:] = attn_mask
     
-    expanded_mask = expanded_mask.unsqueeze(1).unsqueeze(2)
+    expanded_mask = expanded_mask
     expanded_mask = (expanded_mask > 0).bool().to(hidden_states.device)
 
     return expanded_mask
@@ -104,7 +104,7 @@ class EmbedND(nn.Module):
     
 
 class TDRouter(torch.nn.Module):
-    def __init__(self, dim: int, threshold: float = 0.75):
+    def __init__(self, dim: int, threshold: float = 0.5, tau: float = 5, is_hard: bool = True):
         """
         Initialize the TDRouter layer.
 
@@ -118,6 +118,8 @@ class TDRouter(torch.nn.Module):
 
         """
         super().__init__()
+        self.tau = tau
+        self.is_hard = is_hard
         self.threshold = threshold
         self.fc = nn.Linear(
             dim,
@@ -141,18 +143,15 @@ class TDRouter(torch.nn.Module):
         if len(token.shape) == 4:
             B, H, L, D = token.shape
             token = token.permute(0, 2, 1, 3).view(B, L, -1) # (batch, token length, feature)
-        seq_len = token.shape[1]
         
         token = token + cond.unsqueeze(1)  # (batch, 1, feature) + (batch, token length, feature)
 
         logits = self.fc(token).squeeze(-1) # (batch, token length)
-        _softmax = F.softmax(logits, dim=-1)
-        _, indices = _softmax.topk(int((1 - self.threshold) * seq_len), dim=-1, largest=True, sorted=True)
+        mask = _gumbel_sigmoid(logits, training=self.training, hard=self.is_hard, threshold=self.threshold, tau=self.tau)
         
-        # only print the weights of self.fc to check if they are updated during training on main process
-        # if logits.device == torch.device('cuda:0'):
-        #     print(self.fc.weight.sum().item(), self.fc.bias.sum().item(), self.cond_fc.weight.sum().item(), self.cond_fc.bias.sum().item())
-        return indices, logits
+        # _, indices = _softmax.topk(int((1 - self.threshold) * seq_len), dim=-1, largest=True, sorted=True)
+
+        return mask.to(logits.dtype), logits
 
 
 def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 1000.0):
@@ -287,8 +286,8 @@ class DoubleStreamBlock(nn.Module):
         self.mlp_token_select = None
         if attn_token_select:
             self.attn_token_select = TDRouter(hidden_size)
-        if mlp_token_select:
-            self.mlp_token_select = TDRouter(hidden_size)
+        # if mlp_token_select:
+        #     self.mlp_token_select = TDRouter(hidden_size)
 
     def forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor, img_mask: Tensor) -> tuple[Tensor, Tensor]:
         img_mod1, img_mod2 = self.img_mod(vec)
@@ -303,16 +302,19 @@ class DoubleStreamBlock(nn.Module):
         pe_k = pe
         if self.attn_token_select:
             B, H, L, D = img_k.shape
-            txt_len = txt.shape[1]
+            
             sub_token_select, token_logits = self.attn_token_select(img_v, vec)
-            select_L = sub_token_select.shape[1]
-            batch_indices = torch.arange(B).unsqueeze(1).expand(B, select_L)
-            img_k = img_k.transpose(1, 2)[batch_indices, sub_token_select].transpose(1, 2)
-            img_v = img_v.transpose(1, 2)[batch_indices, sub_token_select].transpose(1, 2)
-            img_mask = img_mask[batch_indices, sub_token_select]
-            img_pe = pe.squeeze(1)[:, txt_len:]
-            img_pe = img_pe[batch_indices, sub_token_select].unsqueeze(1)
-            pe_k = torch.cat((pe[:, :, :txt_len], img_pe), dim=2)
+            img_k = img_k * sub_token_select.view(B, 1, L, 1)
+            img_v = img_v * sub_token_select.view(B, 1, L, 1)
+            # txt_len = txt.shape[1]
+            # select_L = sub_token_select.shape[1]
+            # batch_indices = torch.arange(B).unsqueeze(1).expand(B, select_L)
+            # img_k = img_k.transpose(1, 2)[batch_indices, sub_token_select].transpose(1, 2)
+            # img_v = img_v.transpose(1, 2)[batch_indices, sub_token_select].transpose(1, 2)
+            # img_mask = img_mask[batch_indices, sub_token_select]
+            # img_pe = pe.squeeze(1)[:, txt_len:]
+            # img_pe = img_pe[batch_indices, sub_token_select].unsqueeze(1)
+            # pe_k = torch.cat((pe[:, :, :txt_len], img_pe), dim=2)
             
         # prepare txt for attention
         txt_modulated = self.txt_norm1(txt)
@@ -326,10 +328,9 @@ class DoubleStreamBlock(nn.Module):
         k = torch.cat((txt_k, img_k), dim=2)
         v = torch.cat((txt_v, img_v), dim=2)
         
-        # expand attention mask
         if img_mask is not None:
             attn_mask = expand_attn_mask(q, img_mask)
-
+            
         with torch.cuda.device(q.device.index):
             attn = attention(q, k, v, pe_q=pe, pe_k=pe_k, attn_mask=attn_mask)
         txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1] :]
@@ -419,7 +420,6 @@ class SingleStreamBlock(nn.Module):
         q, k, v = rearrange(qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
         q, k = self.norm(q, k, v)
         
-        # expand attention mask after concatenation
         if img_mask is not None:
             attn_mask = expand_attn_mask(q, img_mask)
         
@@ -428,12 +428,14 @@ class SingleStreamBlock(nn.Module):
             B, H, L, D = k.shape
             txt_len = L - img_mask.shape[1]
             sub_token_select, token_logits = self.attn_token_select(v, vec)
-            select_L = sub_token_select.shape[1]
-            batch_indices = torch.arange(B).unsqueeze(1).expand(B, select_L)
-            k = k.transpose(1, 2)[batch_indices, sub_token_select].transpose(1, 2)
-            v = v.transpose(1, 2)[batch_indices, sub_token_select].transpose(1, 2)
-            attn_mask = attn_mask.view(B, L)[batch_indices, sub_token_select].view(B, 1, 1, select_L)
-            pe_k = pe.squeeze(1)[batch_indices, sub_token_select].unsqueeze(1)
+            k = k * sub_token_select.view(B, 1, L, 1)
+            v = v * sub_token_select.view(B, 1, L, 1)
+            # select_L = sub_token_select.shape[1]
+            # batch_indices = torch.arange(B).unsqueeze(1).expand(B, select_L)
+            # k = k.transpose(1, 2)[batch_indices, sub_token_select].transpose(1, 2)
+            # v = v.transpose(1, 2)[batch_indices, sub_token_select].transpose(1, 2)
+            # attn_mask = attn_mask[batch_indices, sub_token_select]
+            # pe_k = pe.squeeze(1)[batch_indices, sub_token_select].unsqueeze(1)
         
         # compute attention
         with torch.cuda.device(q.device.index):
