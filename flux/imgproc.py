@@ -74,17 +74,17 @@ def match_size(w, h, crop_size_list, random_top_k=4):
     return crop_size
 
 
-def generate_crop_size_list(num_patches, patch_size, max_ratio=4.0):
+def generate_crop_size_list(num_patches, patch_size, max_ratio=4.0, step_size=1):
     assert max_ratio >= 1.0
     crop_size_list = []
-    wp, hp = num_patches, 1
+    wp, hp = num_patches, step_size
     while wp > 0:
         if max(wp, hp) / min(wp, hp) <= max_ratio:
             crop_size_list.append((wp * patch_size, hp * patch_size))
-        if (hp + 1) * wp <= num_patches:
-            hp += 1
+        if (hp + step_size) * wp <= num_patches:
+            hp += step_size
         else:
-            wp -= 1
+            wp -= step_size
     return crop_size_list
 
 def to_rgb_if_rgba(img: Image.Image):

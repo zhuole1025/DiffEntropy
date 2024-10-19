@@ -32,7 +32,7 @@ class ItemProcessor(ABC):
 
 
 class MyDataset(Dataset):
-    def __init__(self, config_path, item_processor: ItemProcessor, cache_on_disk=False):
+    def __init__(self, config_path, train_res, item_processor: ItemProcessor, cache_on_disk=False):
         logger.info(f"read dataset config from {config_path}")
         with open(config_path, "r") as f:
             self.config = yaml.load(f, Loader=yaml.FullLoader)
@@ -49,17 +49,31 @@ class MyDataset(Dataset):
         else:
             cache_dir = None
             ann, group_indice_range = self._collect_annotations()
-
+        
         self.ann = ann
         self.group_indices = {key: list(range(val[0], val[1])) for key, val in group_indice_range.items()}
+        self.item_processor = item_processor
+        
+        self.train_res = train_res
+        self.ann = self.filter_images()
 
         logger.info(f"total length: {len(self)}")
 
-        self.item_processor = item_processor
-
     def __len__(self):
         return len(self.ann)
-
+    
+    def filter_images(self):
+        ann = []
+        for index in range(len(self.ann)):
+            try:
+                res = json.loads(self.ann[index])['resolution']
+                res = int(res.split(':')[0])
+                if res >= self.train_res * 0.8:
+                    ann.append(self.ann[index])
+            except Exception as e:
+                logger.info(f"Error processing item {index}: {e}")
+        return ann
+    
     def _collect_annotations(self):
         group_ann = {}
         for meta in self.config["META"]:

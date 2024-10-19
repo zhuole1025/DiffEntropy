@@ -20,13 +20,12 @@ def expand_attn_mask(
     assert bsz == hidden_states.shape[0]
     residual_seq_len = hidden_states.shape[2] # Note: hidden_states is of shape (bsz, num_heads, seq_len, head_dim)
     mask_seq_len = attn_mask.shape[1]
-
-    expanded_mask = torch.ones(bsz, residual_seq_len)
+    
+    expanded_mask = torch.ones(bsz, residual_seq_len, dtype=attn_mask.dtype, device=attn_mask.device)
     start_index = residual_seq_len - mask_seq_len
     expanded_mask[:, start_index:] = attn_mask
     
-    expanded_mask = expanded_mask
-    expanded_mask = (expanded_mask > 0).bool().to(hidden_states.device)
+    # expanded_mask = (expanded_mask > 0)
 
     return expanded_mask
 
@@ -61,6 +60,34 @@ def _gumbel_sigmoid(
         ret = y_hard - y_soft.detach() + y_soft
     else:
         ret = y_soft
+    return ret
+
+
+def MultiHot_Gumbel_Softmax(logits, tau=1, hard=False, dim=-1, sample_tokens=1):
+    """
+    Function: Perform Gumbel-Softmax operation, supporting multi-hot outputs.
+    Parameters:
+    - logits: Input log-probabilities, shape [batch_size, num_features].
+    - tau: Temperature coefficient.
+    - hard: Whether to generate outputs in a hard manner.
+    - dim: Dimension along which to perform the softmax operation.
+    - sample_tokens: The number of elements expected to be set to 1 in the output one-hot encoding.
+    """
+    
+    with torch.random.fork_rng(devices=[logits.device]):
+        gumbels = (
+            -torch.empty_like(logits, memory_format=torch.legacy_contiguous_format).exponential_().log()
+    )  # ~Gumbel(0,1)
+    gumbels = (logits + gumbels) / tau  # ~Gumbel(logits,tau)
+    y_soft = gumbels.softmax(dim)
+
+    if hard:
+        _, indices = y_soft.topk(min(sample_tokens, logits.shape[1]), dim=dim)
+        y_hard = torch.zeros_like(logits).scatter_(dim, indices, 1.0)        
+        ret = y_hard - y_soft.detach() + y_soft
+    else:
+        ret = y_soft
+        
     return ret
 
 
@@ -147,10 +174,11 @@ class TDRouter(torch.nn.Module):
         token = token + cond.unsqueeze(1)  # (batch, 1, feature) + (batch, token length, feature)
 
         logits = self.fc(token).squeeze(-1) # (batch, token length)
-        mask = _gumbel_sigmoid(logits, training=self.training, hard=self.is_hard, threshold=self.threshold, tau=self.tau)
+        # mask = _gumbel_sigmoid(logits, training=self.training, hard=self.is_hard, threshold=self.threshold, tau=self.tau)
+        mask = MultiHot_Gumbel_Softmax(logits, hard=self.is_hard, sample_tokens=4096, tau=self.tau)
+        # import torch.distributed as dist
+        # print(f"rank {dist.get_rank()}, drop ratio {mask.mean().item()}")
         
-        # _, indices = _softmax.topk(int((1 - self.threshold) * seq_len), dim=-1, largest=True, sorted=True)
-
         return mask.to(logits.dtype), logits
 
 
@@ -299,22 +327,30 @@ class DoubleStreamBlock(nn.Module):
         img_qkv = self.img_attn.qkv(img_modulated)
         img_q, img_k, img_v = rearrange(img_qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
         img_q, img_k = self.img_attn.norm(img_q, img_k, img_v)
-        pe_k = pe
+        pe_k = pe.clone()
         if self.attn_token_select:
             B, H, L, D = img_k.shape
+            # drop_mask: [B, L]
+            drop_mask, token_logits = self.attn_token_select(img_v, vec)
+            drop_mask_expanded = drop_mask.unsqueeze(1).unsqueeze(-1).expand_as(img_k)
+            img_k = img_k * drop_mask_expanded
+            img_v = img_v * drop_mask_expanded
+            drop_mask_k = (img_k != 0).any(dim=-1).any(dim=1).unsqueeze(1).unsqueeze(-1).expand(B, H, L, D)
+            # img_k & img_v: [B, H, L', D]
+            img_k = img_k.masked_select(drop_mask_k).view(B, H, -1, D)
+            img_v = img_v.masked_select(drop_mask_k).view(B, H, -1, D)
             
-            sub_token_select, token_logits = self.attn_token_select(img_v, vec)
-            img_k = img_k * sub_token_select.view(B, 1, L, 1)
-            img_v = img_v * sub_token_select.view(B, 1, L, 1)
-            # txt_len = txt.shape[1]
-            # select_L = sub_token_select.shape[1]
-            # batch_indices = torch.arange(B).unsqueeze(1).expand(B, select_L)
-            # img_k = img_k.transpose(1, 2)[batch_indices, sub_token_select].transpose(1, 2)
-            # img_v = img_v.transpose(1, 2)[batch_indices, sub_token_select].transpose(1, 2)
-            # img_mask = img_mask[batch_indices, sub_token_select]
-            # img_pe = pe.squeeze(1)[:, txt_len:]
-            # img_pe = img_pe[batch_indices, sub_token_select].unsqueeze(1)
-            # pe_k = torch.cat((pe[:, :, :txt_len], img_pe), dim=2)
+            # pe
+            txt_len = txt.shape[1]
+            img_pe = pe.squeeze(1)[:, txt_len:]
+            drop_mask_expanded = drop_mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).expand_as(img_pe).bool()
+            img_pe = img_pe.masked_select(drop_mask_expanded).view(B, -1, img_pe.shape[2], img_pe.shape[3], img_pe.shape[4]).unsqueeze(1)
+            pe_k = torch.cat((pe[:, :, :txt_len], img_pe), dim=2)
+            
+            # attn mask
+            drop_mask = (drop_mask[drop_mask > 0] * img_mask[drop_mask > 0]).view(B, -1).bool()
+        else:
+            drop_mask = img_mask
             
         # prepare txt for attention
         txt_modulated = self.txt_norm1(txt)
@@ -330,9 +366,10 @@ class DoubleStreamBlock(nn.Module):
         
         if img_mask is not None:
             attn_mask = expand_attn_mask(q, img_mask)
+            drop_mask = expand_attn_mask(k, drop_mask)
             
         with torch.cuda.device(q.device.index):
-            attn = attention(q, k, v, pe_q=pe, pe_k=pe_k, attn_mask=attn_mask)
+            attn = attention(q, k, v, pe_q=pe, pe_k=pe_k, attn_mask=attn_mask, drop_mask=drop_mask)
         txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1] :]
 
         # calculate the img bloks
@@ -423,23 +460,27 @@ class SingleStreamBlock(nn.Module):
         if img_mask is not None:
             attn_mask = expand_attn_mask(q, img_mask)
         
-        pe_k = pe
+        pe_k = pe.clone()
         if self.attn_token_select:
             B, H, L, D = k.shape
-            txt_len = L - img_mask.shape[1]
-            sub_token_select, token_logits = self.attn_token_select(v, vec)
-            k = k * sub_token_select.view(B, 1, L, 1)
-            v = v * sub_token_select.view(B, 1, L, 1)
-            # select_L = sub_token_select.shape[1]
-            # batch_indices = torch.arange(B).unsqueeze(1).expand(B, select_L)
-            # k = k.transpose(1, 2)[batch_indices, sub_token_select].transpose(1, 2)
-            # v = v.transpose(1, 2)[batch_indices, sub_token_select].transpose(1, 2)
-            # attn_mask = attn_mask[batch_indices, sub_token_select]
-            # pe_k = pe.squeeze(1)[batch_indices, sub_token_select].unsqueeze(1)
+            drop_mask, token_logits = self.attn_token_select(v, vec)
+            drop_mask_expanded = drop_mask.unsqueeze(1).unsqueeze(-1).expand_as(k)
+            k = k * drop_mask_expanded
+            v = v * drop_mask_expanded
+            drop_mask_k = (k != 0).any(dim=-1).any(dim=1).unsqueeze(1).unsqueeze(-1).expand(B, H, L, D)
+            k = k.masked_select(drop_mask_k).view(B, H, -1, D)
+            v = v.masked_select(drop_mask_k).view(B, H, -1, D)
+            
+            # pe
+            drop_mask_expanded = drop_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).expand_as(pe).bool()
+            pe_k = pe.masked_select(drop_mask_expanded).view(B, pe.shape[1], -1, *pe.shape[3:]).unsqueeze(1)
+            
+            drop_mask = (drop_mask[drop_mask > 0] * attn_mask[drop_mask > 0]).view(B, -1).bool()
+        else:
+            drop_mask = attn_mask
         
-        # compute attention
         with torch.cuda.device(q.device.index):
-            attn = attention(q, k, v, pe_q=pe, pe_k=pe_k, attn_mask=attn_mask)
+            attn = attention(q, k, v, pe_q=pe, pe_k=pe_k, attn_mask=attn_mask, drop_mask=drop_mask)
         
         # compute activation in mlp stream, cat again and run second linear layer
         output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))

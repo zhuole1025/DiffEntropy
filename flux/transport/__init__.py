@@ -9,7 +9,6 @@ def create_transport(
     sample_eps=None,
     snr_type="uniform",
     do_shift=True,
-    seq_len=1024,  # corresponding to 512x512
     token_target_ratio=0.5,
     token_loss_weight=1.0,
 ):
@@ -66,7 +65,6 @@ def create_transport(
         sample_eps=sample_eps,
         snr_type=snr_type,
         do_shift=do_shift,
-        seq_len=seq_len,
         token_target_ratio=token_target_ratio,
         token_loss_weight=token_loss_weight,
     )

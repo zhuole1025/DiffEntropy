@@ -80,14 +80,21 @@ class Flux(nn.Module):
         img: Tensor,
         timesteps: Tensor,
         img_ids: Tensor,
+        img_cond: Tensor,
+        img_cond_ids: Tensor,
         txt: Tensor,
         txt_ids: Tensor,
         y: Tensor,
-        guidance: Tensor | None = None,
-        img_mask: Tensor | None = None,
+        guidance: Tensor = None,
+        img_mask: Tensor = None,
+        img_cond_mask: Tensor = None
     ) -> Tensor:
         if img.ndim != 3 or txt.ndim != 3:
             raise ValueError("Input img and txt tensors must have 3 dimensions.")
+        
+        img = torch.cat([img_cond, img], dim=1)
+        img_ids = torch.cat([img_cond_ids, img_ids], dim=1)
+        img_mask = torch.cat([img_cond_mask, img_mask], dim=1)
 
         # running on sequences img
         img = self.img_in(img)
@@ -117,6 +124,7 @@ class Flux(nn.Module):
                 token_select_list.append(sub_token_select)
                 token_logits_list.append(token_logits)
         img = img[:, txt.shape[1] :, ...]
+        img = img[:, img_cond.shape[1] :, ...]
         
         token_select = torch.stack(token_select_list, dim=1) if len(token_select_list) > 0 else None
         token_logits = torch.stack(token_logits_list, dim=1) if len(token_logits_list) > 0 else None

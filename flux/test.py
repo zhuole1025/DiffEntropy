@@ -182,22 +182,25 @@ def test_mask(
 
 def generate_mask_mod(attn_mask):
     def mask_mod(batch, head, token_q, token_kv):
-        return attn_mask
+        return attn_mask[batch, head, token_q, token_kv]
     return mask_mod
 
 # Create input tensors
-query = torch.randn(8, 8, 2048, 64, device="cuda", dtype=torch.float32)
-key = torch.randn(8, 8, 2048, 64, device="cuda", dtype=torch.float32)
-value = torch.randn(8, 8, 2048, 64, device="cuda", dtype=torch.float32)
-attn_mask = (torch.randn(8, 8, 2048, 2048, device="cuda", dtype=torch.float32) > 0).bool()
+query = torch.randn(8, 8, 512, 64, device="cuda", dtype=torch.float32)
+key = torch.randn(8, 8, 512, 64, device="cuda", dtype=torch.float32)
+value = torch.randn(8, 8, 512, 64, device="cuda", dtype=torch.float32)
+attn_mask = (torch.ones(8, 8, 512, 512, device="cuda", dtype=torch.float32) > 0).bool()
+attn_mask[:, :, 10, :] = False
 mask_mode = generate_mask_mod(attn_mask)
-block_mask = create_block_mask(mask_mode, None, None, 2048, 2048)
-# Call flex_attention with the checkerboard score modification
+block_mask = create_block_mask(mask_mode, 8, 8, 512, 512)
 output = flex_attention(query, key, value, block_mask=block_mask)
 
 # Compile and run
-compiled_flex_attention = torch.compile(flex_attention)
-out_compiled = compiled_flex_attention(query, key, value, block_mask=block_mask)
+# compiled_flex_attention = torch.compile(flex_attention)
+# out_compiled = compiled_flex_attention(query, key, value, block_mask=block_mask)
+breakpoint()
+# Use normal attention
+output_normal = F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask)
 
 # Check if the results are close
-print(torch.testing.assert_close(output, out_compiled, atol=2e-2, rtol=2e-2))
+print(torch.testing.assert_close(output, output_normal, atol=2e-2, rtol=2e-2))

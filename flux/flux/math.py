@@ -1,6 +1,7 @@
 from einops import rearrange
 import torch
 from torch import Tensor
+from torch.nn.attention.flex_attention import create_block_mask, create_block_mask, flex_attention
 import torch.nn.functional as F
 from flash_attn import flash_attn_varlen_func
 from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
@@ -21,7 +22,7 @@ def _upad_input(query_layer, key_layer, value_layer, query_mask, key_mask, query
     indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(key_mask)
     _, q_seq_len, num_query_heads, _ = query_layer.shape
     batch_size, kv_seq_len, num_key_value_heads, head_dim = key_layer.shape
-
+    
     key_layer = index_first_axis(
         key_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim),
         indices_k,
@@ -30,7 +31,7 @@ def _upad_input(query_layer, key_layer, value_layer, query_mask, key_mask, query
         value_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim),
         indices_k,
     )
-    if query_length == kv_seq_len:
+    if query_length == kv_seq_len and key_mask is None:
         query_layer = index_first_axis(
             query_layer.reshape(batch_size * kv_seq_len, num_query_heads, head_dim),
             indices_k,
@@ -60,7 +61,7 @@ def _upad_input(query_layer, key_layer, value_layer, query_mask, key_mask, query
     )
         
         
-def attention(q: Tensor, k: Tensor, v: Tensor, pe_q: Tensor, pe_k: Tensor, attn_mask: Tensor | None = None) -> Tensor:
+def attention(q: Tensor, k: Tensor, v: Tensor, pe_q: Tensor, pe_k: Tensor, attn_mask: Tensor | None = None, drop_mask: Tensor | None = None) -> Tensor:
     q, k = apply_rope(q, k, pe_q, pe_k)
     
     q = q.transpose(1, 2)
@@ -75,7 +76,7 @@ def attention(q: Tensor, k: Tensor, v: Tensor, pe_q: Tensor, pe_k: Tensor, attn_
         indices_q,
         cu_seq_lens,
         max_seq_lens,
-    ) = _upad_input(q, k, v, attn_mask, attn_mask, L)
+    ) = _upad_input(q, k, v, attn_mask, drop_mask, L)
     
     cu_seqlens_q, cu_seqlens_k = cu_seq_lens
     max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
@@ -94,7 +95,19 @@ def attention(q: Tensor, k: Tensor, v: Tensor, pe_q: Tensor, pe_k: Tensor, attn_
     x = pad_input(attn_output_unpad, indices_q, B, L)
     x = rearrange(x, "B L H D -> B L (H D)")
     
-    # attn_mask = attn_mask.unsqueeze(1).unsqueeze(2)
+    # B, H, L, D = q.shape
+    # def generate_mask_mod(attn_mask, drop_mask):
+    #     def mask_mod(batch, head, token_q, token_kv):
+    #         return attn_mask[batch, token_q] & drop_mask[batch, token_kv]
+    #     return mask_mod
+    # mask_mod = generate_mask_mod(attn_mask, drop_mask)
+    # block_mask = create_block_mask(mask_mod, B, None, L, L, _compile=True)    
+    # x = flex_attention(q, k, v, block_mask=block_mask)
+    # x = rearrange(x, "B H L D -> B L (H D)")
+    
+    # attn_mask = attn_mask.unsqueeze(1).unsqueeze(-1)
+    # drop_mask = drop_mask.unsqueeze(1).unsqueeze(2)
+    # attn_mask = attn_mask * drop_mask
     # x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
     # x = rearrange(x, "B H L D -> B L (H D)")
     

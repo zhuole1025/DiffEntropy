@@ -21,11 +21,14 @@ import random
 import socket
 from time import time
 import warnings
+from safetensors import safe_open
+import wandb
 
 from PIL import Image
 import fairscale.nn.model_parallel.initialize as fs_init
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     CheckpointImpl,
     apply_activation_checkpointing,
@@ -48,7 +51,7 @@ from diffusers import AutoencoderKL
 from data import ItemProcessor, MyDataset
 from flux.sampling import prepare
 from flux.util import load_ae, load_clip, load_flow_model, load_t5
-from imgproc import generate_crop_size_list, to_rgb_if_rgba, var_pad
+from imgproc import generate_crop_size_list, to_rgb_if_rgba, var_center_crop
 from parallel import distributed_init, get_intra_node_process_group
 from transport import create_transport
 from util.misc import SmoothedValue
@@ -64,6 +67,7 @@ class T2IItemProcessor(ItemProcessor):
         self.image_transform = transform
 
     def process_item(self, data_item, training_mode=False):
+        text_emb = None
         if "conversations" in data_item:
             assert "image" in data_item and len(data_item["conversations"]) == 2
             image = Image.open(read_general(data_item["image"])).convert("RGB")
@@ -72,6 +76,9 @@ class T2IItemProcessor(ItemProcessor):
             image_path = data_item["path"]
             image = Image.open(image_path).convert("RGB")
             text = data_item["gpt_4_caption"]
+            if "text_embeddings_path" in data_item:
+                with safe_open(data_item["text_embeddings_path"], framework="pt", device="cpu") as f:
+                    text_emb = {k: f.get_tensor(k) for k in f.keys()}
         elif "image_url" in data_item:
             url = data_item["image_url"]
             url = url.replace(
@@ -110,7 +117,7 @@ class T2IItemProcessor(ItemProcessor):
 
         image = self.image_transform(image)
 
-        return image, text
+        return image, text, text_emb
 
 
 #############################################################################
@@ -121,7 +128,8 @@ class T2IItemProcessor(ItemProcessor):
 def dataloader_collate_fn(samples):
     image = [x[0] for x in samples]
     caps = [x[1] for x in samples]
-    return image, caps
+    text_emb = [x[2] for x in samples]
+    return image, caps, text_emb
 
 
 def get_train_sampler(dataset, rank, world_size, global_batch_size, max_steps, resume_step, seed):
@@ -287,7 +295,7 @@ def main(args):
         # Create wandb logger
         if args.use_wandb:
             wandb.init(
-                project="Lumina",
+                project="FLUX",
                 name=args.results_dir.split("/")[-1],
                 config=args.__dict__,  # Use args.__dict__ to pass all arguments
                 dir=args.results_dir,  # Set the directory for wandb files
@@ -300,26 +308,33 @@ def main(args):
 
     logger.info("Training arguments: " + json.dumps(args.__dict__, indent=2))
 
-    model_name = "flux-dev"
-    t5 = load_t5(max_length=512)
-    t5 = setup_lm_fsdp_sync(
-        t5,
-        functools.partial(
-            lambda_auto_wrap_policy,
-            lambda_fn=lambda m: m in list(t5.hf_module.encoder.block),
-        ),
-    )
+    if args.load_t5:
+        t5 = load_t5(max_length=512)
+        t5 = setup_lm_fsdp_sync(
+            t5,
+            functools.partial(
+                lambda_auto_wrap_policy,
+                lambda_fn=lambda m: m in list(t5.hf_module.encoder.block),
+            ),
+        )
+        logger.info("T5 loaded")
+    else:
+        t5 = None
 
-    clip = load_clip()
-    clip = setup_lm_fsdp_sync(
-        clip,
-        functools.partial(
-            lambda_auto_wrap_policy,
-            lambda_fn=lambda m: m in list(clip.hf_module.text_model.encoder.layers),
-        ),
-    )
-
-    model = load_flow_model(model_name, device=device_str, dtype=torch.bfloat16)
+    if args.load_clip:
+        clip = load_clip()
+        clip = setup_lm_fsdp_sync(
+            clip,
+            functools.partial(
+                lambda_auto_wrap_policy,
+                lambda_fn=lambda m: m in list(clip.hf_module.text_model.encoder.layers),
+            ),
+        )
+        logger.info(f"CLIP loaded")
+    else:
+        clip = None
+    
+    model = load_flow_model("flux-dev", device=device_str, dtype=torch.bfloat16, attn_token_select=args.attn_token_select, mlp_token_select=args.mlp_token_select)
     ae = AutoencoderKL.from_pretrained(f"black-forest-labs/FLUX.1-dev", subfolder="vae", torch_dtype=torch.bfloat16).to(device)
     ae.requires_grad_(False)
     total_params = model.parameter_count()
@@ -455,41 +470,55 @@ def main(args):
             resume_step = int(f.read().strip())
     else:
         resume_step = 0
+    
+    # default: 1000 steps, linear noise schedule
+    transport = create_transport(
+        "Linear",
+        "velocity",
+        None,
+        None,
+        None,
+        snr_type=args.snr_type,
+        do_shift=args.do_shift,
+        token_target_ratio=args.token_target_ratio,
+        token_loss_weight=args.token_loss_weight,
+    )  # default: velocity;
 
     # Setup data:
+    logger.info(f"Creating data")
     data_collection = {}
-    for train_res in [args.image_size]:
-        logger.info(f"Creating data for resolution {train_res}")
-
-        global_bsz = args.global_bsz
-        local_bsz = global_bsz // dp_world_size  # todo caution for sequence parallel
-        micro_bsz = args.micro_bsz
-        assert global_bsz % dp_world_size == 0, "Batch size must be divisible by data parallel world size."
-        logger.info(f"Global bsz: {global_bsz} Local bsz: {local_bsz} Micro bsz: {micro_bsz}")
-
-        patch_size = 16
-        logger.info(f"patch size: {patch_size}")
-        max_num_patches = round((train_res / patch_size) ** 2)
-        logger.info(f"Limiting number of patches to {max_num_patches}.")
-        pad_size_list = generate_crop_size_list(max_num_patches, patch_size)
-        logger.info("List of pad sizes:")
-        for i in range(0, len(pad_size_list), 6):
-            logger.info(" " + "".join([f"{f'{w} x {h}':14s}" for w, h in pad_size_list[i : i + 6]]))
+    crop_size_dict = {}
+    global_bsz = args.global_bsz
+    local_bsz = global_bsz // dp_world_size  # todo caution for sequence parallel
+    micro_bsz = args.micro_bsz
+    num_samples = global_bsz * args.max_steps
+    assert global_bsz % dp_world_size == 0, "Batch size must be divisible by data parallel world size."
+    logger.info(f"Global bsz: {global_bsz} Local bsz: {local_bsz} Micro bsz: {micro_bsz}")
+    patch_size = 16
+    logger.info(f"patch size: {patch_size}")
+    for train_res in args.high_res_list:
+        scale_factor = train_res // min(args.low_res_list)
+        max_num_patches = round((train_res / patch_size) ** 2) // scale_factor * scale_factor
+        crop_size_list = generate_crop_size_list(max_num_patches, patch_size, step_size=scale_factor)
+        crop_size_dict[train_res] = crop_size_list
+        logger.info("List of crop sizes:")
+        for i in range(0, len(crop_size_list), 6):
+            logger.info(" " + "".join([f"{f'{w} x {h}':14s}" for w, h in crop_size_list[i : i + 6]]))
         image_transform = transforms.Compose(
             [
-                transforms.Lambda(functools.partial(var_pad, pad_size_list=pad_size_list, random_top_k=1)),
-                # transforms.RandomHorizontalFlip(),
+                transforms.Lambda(lambda img: to_rgb_if_rgba(img)),
+                transforms.Lambda(functools.partial(var_center_crop, crop_size_list=crop_size_list, random_top_k=1)),
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
             ]
         )
         dataset = MyDataset(
             args.data_path,
+            train_res,
             item_processor=T2IItemProcessor(image_transform),
             cache_on_disk=args.cache_data_on_disk,
         )
-        num_samples = global_bsz * args.max_steps
-        logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
+        logger.info(f"Dataset for {train_res} contains {len(dataset):,} images ({args.data_path})")
         logger.info(f"Total # samples to consume: {num_samples:,} " f"({num_samples / len(dataset):.2f} epochs)")
         sampler = get_train_sampler(
             dataset,
@@ -498,7 +527,7 @@ def main(args):
             global_bsz,
             args.max_steps,
             resume_step,
-            args.global_seed + train_res * 100,  # avoid same sampling for different resolutions
+            args.global_seed
         )
         loader = DataLoader(
             dataset,
@@ -508,20 +537,6 @@ def main(args):
             pin_memory=True,
             collate_fn=dataloader_collate_fn,
         )
-
-        # default: 1000 steps, linear noise schedule
-        transport = create_transport(
-            "Linear",
-            "velocity",
-            None,
-            None,
-            None,
-            snr_type=args.snr_type,
-            do_shift=args.do_shift,
-            seq_len=(train_res // 16) ** 2,
-            token_target_ratio=args.token_target_ratio,
-            token_loss_weight=args.token_loss_weight,
-        )  # default: velocity;
 
         data_collection[train_res] = {
             "loader": loader,
@@ -540,82 +555,100 @@ def main(args):
 
     logger.info(f"Training for {args.max_steps:,} steps...")
 
+    start_time = time()
     for step in range(resume_step, args.max_steps):
-        start_time = time()
-        for train_res, data_pack in data_collection.items():
-            x, caps = next(data_pack["loader_iter"])
-            x = [img.to(device, non_blocking=True) for img in x]
-
-            with torch.no_grad():
-                # Map input images to latent space + normalize latents:
+        high_res = random.choices(args.high_res_list, weights=args.high_res_probs)[0]
+        low_res = random.choices(args.low_res_list, weights=args.low_res_probs)[0]
+        high_res = torch.tensor(high_res, device=device)
+        low_res = torch.tensor(low_res, device=device)
+        torch.distributed.broadcast(high_res, src=0)
+        torch.distributed.broadcast(low_res, src=0)
+        high_res = high_res.item()
+        low_res = low_res.item()
+        ds_factor = high_res // low_res
+        data_pack = data_collection[high_res]
+        
+        x, caps, text_emb = next(data_pack["loader_iter"])
+        x = [img.to(device, non_blocking=True) for img in x]
+        
+        with torch.no_grad():
+            # Map input images to latent space + normalize latents:
+            x_cond = [F.interpolate(img[None], size=(img.shape[-2] // ds_factor, img.shape[-1] // ds_factor), mode="bilinear", align_corners=False)[0] for img in x]
+            x_cond = [(ae.encode(img[None].to(ae.dtype)).latent_dist.sample()[0] - ae.config.shift_factor) * ae.config.scaling_factor for img in x_cond]
+            if high_res > 3072:
+                x = [(ae.tiled_encode(img[None].to(ae.dtype)).latent_dist.sample()[0] - ae.config.shift_factor) * ae.config.scaling_factor for img in x]
+            else:
                 x = [(ae.encode(img[None].to(ae.dtype)).latent_dist.sample()[0] - ae.config.shift_factor) * ae.config.scaling_factor for img in x]
+            
+        with torch.no_grad():
+            inp = prepare(t5=t5, clip=clip, img=x, img_cond=x_cond, prompt=caps, proportion_empty_prompts=args.caption_dropout_prob, text_emb=text_emb)
 
-            with torch.no_grad():
-                inp = prepare(t5=t5, clip=clip, img=x, prompt=caps, proportion_empty_prompts=args.caption_dropout_prob)
+        loss_item = 0.0
+        opt.zero_grad()
+        for mb_idx in range((data_pack["local_bsz"] - 1) // data_pack["micro_bsz"] + 1):
+            mb_st = mb_idx * data_pack["micro_bsz"]
+            mb_ed = min((mb_idx + 1) * data_pack["micro_bsz"], data_pack["local_bsz"])
+            last_mb = mb_ed == data_pack["local_bsz"]
 
-            loss_item = 0.0
-            opt.zero_grad()
-            for mb_idx in range((data_pack["local_bsz"] - 1) // data_pack["micro_bsz"] + 1):
-                mb_st = mb_idx * data_pack["micro_bsz"]
-                mb_ed = min((mb_idx + 1) * data_pack["micro_bsz"], data_pack["local_bsz"])
-                last_mb = mb_ed == data_pack["local_bsz"]
+            x_mb = inp["img"][mb_st:mb_ed]
+            
+            model_kwargs = dict(
+                img_ids=inp["img_ids"][mb_st:mb_ed],
+                img_cond=inp["img_cond"][mb_st:mb_ed],
+                img_cond_ids=inp["img_cond_ids"][mb_st:mb_ed],
+                txt=inp["txt"][mb_st:mb_ed],
+                txt_ids=inp["txt_ids"][mb_st:mb_ed],
+                y=inp["vec"][mb_st:mb_ed],
+                img_mask=inp["img_mask"][mb_st:mb_ed],
+                img_cond_mask=inp["img_cond_mask"][mb_st:mb_ed],
+                guidance=torch.full((x_mb.shape[0],), 4.0, device=x_mb.device, dtype=x_mb.dtype),
+            )
+            with {
+                "bf16": torch.cuda.amp.autocast(dtype=torch.bfloat16),
+                "fp16": torch.cuda.amp.autocast(dtype=torch.float16),
+                "fp32": contextlib.nullcontext(),
+                "tf32": contextlib.nullcontext(),
+            }[args.precision]:
+                loss_dict = data_pack["transport"].training_losses(model, x_mb, model_kwargs)
+            loss = loss_dict["loss"].sum() / data_pack["local_bsz"]
+            loss_item += loss.item()
+            with model.no_sync() if args.data_parallel in ["sdp"] and not last_mb else contextlib.nullcontext():
+                loss.backward()
 
-                x_mb = inp["img"][mb_st:mb_ed]
+        grad_norm = model.clip_grad_norm_(max_norm=args.grad_clip)
 
-                model_kwargs = dict(
-                    img_ids=inp["img_ids"][mb_st:mb_ed],
-                    txt=inp["txt"][mb_st:mb_ed],
-                    txt_ids=inp["txt_ids"][mb_st:mb_ed],
-                    y=inp["vec"][mb_st:mb_ed],
-                    img_mask=inp["img_mask"][mb_st:mb_ed],
-                    guidance=torch.full((x_mb.shape[0],), 4.0, device=x_mb.device, dtype=x_mb.dtype),
-                )
-                with {
-                    "bf16": torch.cuda.amp.autocast(dtype=torch.bfloat16),
-                    "fp16": torch.cuda.amp.autocast(dtype=torch.float16),
-                    "fp32": contextlib.nullcontext(),
-                    "tf32": contextlib.nullcontext(),
-                }[args.precision]:
-                    loss_dict = data_pack["transport"].training_losses(model, x_mb, model_kwargs)
-                loss = loss_dict["loss"].sum() / data_pack["local_bsz"]
-                loss_item += loss.item()
-                with model.no_sync() if args.data_parallel in ["sdp"] and not last_mb else contextlib.nullcontext():
-                    loss.backward()
-
-            grad_norm = model.clip_grad_norm_(max_norm=args.grad_clip)
-
-            if tb_logger is not None:
-                tb_logger.add_scalar(f"{train_res}/loss", loss_item, step)
-                tb_logger.add_scalar(f"{train_res}/grad_norm", grad_norm, step)
-                tb_logger.add_scalar(f"{train_res}/lr", opt.param_groups[0]["lr"], step)
+        if tb_logger is not None:
+            tb_logger.add_scalar(f"train/loss", loss_item, step)
+            tb_logger.add_scalar(f"train/grad_norm", grad_norm, step)
+            tb_logger.add_scalar(f"train/lr", opt.param_groups[0]["lr"], step)
                 
-            if args.use_wandb and rank == 0:
-                wandb.log({
-                    "train/loss": loss_item,
-                    "train/grad_norm": grad_norm,
-                    "train/lr": opt.param_groups[0]["lr"],
-                }, step=step)
+        if args.use_wandb and rank == 0:
+            wandb.log({
+                "train/loss": loss_item,
+                "train/grad_norm": grad_norm,
+                "train/lr": opt.param_groups[0]["lr"],
+            }, step=step)
 
-            opt.step()
-            end_time = time()
+        opt.step()
+        end_time = time()
 
-            # Log loss values:
-            metrics = data_pack["metrics"]
-            metrics["loss"].update(loss_item)
-            metrics["grad_norm"].update(grad_norm)
-            metrics["Secs/Step"].update(end_time - start_time)
-            metrics["Imgs/Sec"].update(data_pack["global_bsz"] / (end_time - start_time))
-            metrics["grad_norm"].update(grad_norm)
-            if (step + 1) % args.log_every == 0:
-                # Measure training speed:
-                torch.cuda.synchronize()
-                logger.info(
-                    f"Res{train_res}: (step{step + 1:07d}) "
-                    + f"lr{opt.param_groups[0]['lr']:.6f} "
-                    + " ".join([f"{key}:{str(val)}" for key, val in metrics.items()])
-                )
+        # Log loss values:
+        metrics = data_pack["metrics"]
+        metrics["loss"].update(loss_item)
+        metrics["grad_norm"].update(grad_norm)
+        metrics["Secs/Step"].update(end_time - start_time)
+        metrics["Imgs/Sec"].update(data_pack["global_bsz"] / (end_time - start_time))
+        metrics["grad_norm"].update(grad_norm)
+        if (step + 1) % args.log_every == 0:
+            # Measure training speed:
+            torch.cuda.synchronize()
+            logger.info(
+                f"Res{high_res}: (step{step + 1:07d}) "
+                + f"lr{opt.param_groups[0]['lr']:.6f} "
+                + " ".join([f"{key}:{str(val)}" for key, val in metrics.items()])
+            )
 
-            start_time = time()
+        start_time = time()
 
         update_ema(model_ema, model)
 
@@ -699,11 +732,13 @@ if __name__ == "__main__":
     parser.add_argument("--max_steps", type=int, default=100_000, help="Number of training steps.")
     # parser.add_argument("--global_bsz_256", type=int, default=256)
     # parser.add_argument("--micro_bsz_256", type=int, default=1)
-    parser.add_argument("--image_size", type=int, default=512)
+    # parser.add_argument("--image_size", type=int, default=512)
     parser.add_argument("--global_bsz", type=int, default=256)
     parser.add_argument("--micro_bsz", type=int, default=1)
     # parser.add_argument("--global_bsz_1024", type=int, default=256)
     # parser.add_argument("--micro_bsz_1024", type=int, default=1)
+    parser.add_argument("--load_t5", action="store_true")
+    parser.add_argument("--load_clip", action="store_true")
     parser.add_argument("--global_seed", type=int, default=0)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--log_every", type=int, default=100)
@@ -756,9 +791,38 @@ if __name__ == "__main__":
         dest="do_shift",
         help="Do dynamic time shifting",
     )
+    parser.add_argument(
+        "--low_res_list",
+        type=str,
+        default="256,512,1024",
+        help="Comma-separated list of low resolution for training."
+    )
+    parser.add_argument(
+        "--high_res_list",
+        type=str,
+        default="1024,2048,4096",
+        help="Comma-separated list of high resolution for training."
+    )
+    parser.add_argument(
+        "--high_res_probs",
+        type=str,
+        default="0.2,0.7,0.1",
+        help="Comma-separated list of probabilities for sampling high resolution images."
+    )
+    parser.add_argument(
+        "--low_res_probs",
+        type=str,
+        default="0.2,0.7,0.1",
+        help="Comma-separated list of probabilities for sampling low resolution images."
+    )
     parser.add_argument("--token_target_ratio", type=float, default=0.5)
     parser.add_argument("--token_loss_weight", type=float, default=1.0)
-    parser.add_argument("--use_wandb", type=bool, default=False)
+    parser.add_argument("--attn_token_select", action="store_true")
+    parser.add_argument("--mlp_token_select", action="store_true")
+    parser.add_argument("--use_wandb", action="store_true")
     args = parser.parse_args()
-
+    args.low_res_list = [int(res) for res in args.low_res_list.split(",")]
+    args.high_res_list = [int(res) for res in args.high_res_list.split(",")]
+    args.high_res_probs = [float(prob) for prob in args.high_res_probs.split(",")]
+    args.low_res_probs = [float(prob) for prob in args.low_res_probs.split(",")]
     main(args)

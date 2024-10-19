@@ -41,7 +41,7 @@ class WeightType(enum.Enum):
 
 
 class Transport:
-    def __init__(self, *, model_type, path_type, loss_type, train_eps, sample_eps, snr_type, do_shift, seq_len, token_target_ratio, token_loss_weight):
+    def __init__(self, *, model_type, path_type, loss_type, train_eps, sample_eps, snr_type, do_shift, token_target_ratio, token_loss_weight):
         path_options = {
             PathType.LINEAR: path.ICPlan,
             PathType.GVP: path.GVPCPlan,
@@ -56,7 +56,6 @@ class Transport:
 
         self.snr_type = snr_type
         self.do_shift = do_shift
-        self.seq_len = seq_len
         self.token_target_ratio = token_target_ratio
         self.token_loss_weight = token_loss_weight
 
@@ -124,7 +123,7 @@ class Transport:
         if self.do_shift:
             base_shift: float = 0.5
             max_shift: float = 1.15
-            mu = self.get_lin_function(y1=base_shift, y2=max_shift)(self.seq_len)
+            mu = self.get_lin_function(y1=base_shift, y2=max_shift)(x1.shape[1])
             t = self.time_shift(mu, 1.0, t)
 
         t = t.to(x1[0])
