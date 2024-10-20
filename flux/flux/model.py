@@ -137,20 +137,23 @@ class Flux(nn.Module):
         img: Tensor,
         timesteps: Tensor,
         img_ids: Tensor,
+        img_cond: Tensor,
+        img_cond_ids: Tensor,
         txt: Tensor,
         txt_ids: Tensor,
         y: Tensor,
-        guidance: Tensor | None = None,
-        cfg_scale: float = 1.0
+        guidance: Tensor = None,
+        img_mask: Tensor = None,
+        img_cond_mask: Tensor = None,
+        txt_cfg_scale: float = 1.0,
+        img_cfg_scale: float = 1.0,
     ) -> Tensor:
-
-        print(timesteps, img.shape, flush=True)
         half = img[: len(img) // 2]
         combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, timesteps, img_ids, txt, txt_ids, y, guidance)
+        model_out, _, _ = self.forward(combined, timesteps, img_ids, img_cond, img_cond_ids, txt, txt_ids, y, guidance, img_mask, img_cond_mask)
 
         cond_eps, uncond_eps = torch.split(model_out, len(model_out) // 2, dim=0)
-        half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
+        half_eps = uncond_eps + txt_cfg_scale * (cond_eps - uncond_eps)
         eps = torch.cat([half_eps, half_eps], dim=0)
         return eps
 

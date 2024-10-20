@@ -13,7 +13,7 @@ high_res_list=1024,2048,4096
 high_res_probs=0.5,0.5,0.0
 snr_type=lognorm
 
-exp_name=test
+exp_name=${high_res_list}_${high_res_probs}_wo_drop
 mkdir -p results/"$exp_name"
 
 # unset NCCL_IB_HCA
@@ -37,6 +37,5 @@ torchrun --nproc_per_node=8 --nnodes=1 --master_port 29348 train.py \
     --checkpointing \
     --high_res_list ${high_res_list} \
     --high_res_probs ${high_res_probs} \
-    --attn_token_select \
     --use_wandb
     

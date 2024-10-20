@@ -54,7 +54,7 @@ def prepare(t5: HFEmbedder, clip: HFEmbedder, img: Tensor, img_cond: Tensor, pro
         img_ids = repeat(img_ids, "h w c -> b (h w) c", b=bs)
         img_cond_ids = repeat(img_cond_ids, "h w c -> b (h w) c", b=bs)
         img_mask = torch.ones(bs, img.shape[1], device=img.device, dtype=torch.int32)
-        # img_cond_mask = torch.ones(bs, img_cond.shape[1], device=img_cond.device, dtype=torch.int32) 
+        img_cond_mask = torch.ones(bs, img_cond.shape[1], device=img_cond.device, dtype=torch.int32) 
         # TODO: check this
         
     else:

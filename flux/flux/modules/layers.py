@@ -473,7 +473,7 @@ class SingleStreamBlock(nn.Module):
             
             # pe
             drop_mask_expanded = drop_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).expand_as(pe).bool()
-            pe_k = pe.masked_select(drop_mask_expanded).view(B, pe.shape[1], -1, *pe.shape[3:]).unsqueeze(1)
+            pe_k = pe.masked_select(drop_mask_expanded).view(B, pe.shape[1], -1, *pe.shape[3:])
             
             drop_mask = (drop_mask[drop_mask > 0] * attn_mask[drop_mask > 0]).view(B, -1).bool()
         else:

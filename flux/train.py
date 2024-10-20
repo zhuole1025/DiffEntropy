@@ -487,7 +487,6 @@ def main(args):
     # Setup data:
     logger.info(f"Creating data")
     data_collection = {}
-    crop_size_dict = {}
     global_bsz = args.global_bsz
     local_bsz = global_bsz // dp_world_size  # todo caution for sequence parallel
     micro_bsz = args.micro_bsz
@@ -500,7 +499,6 @@ def main(args):
         scale_factor = train_res // min(args.low_res_list)
         max_num_patches = round((train_res / patch_size) ** 2) // scale_factor * scale_factor
         crop_size_list = generate_crop_size_list(max_num_patches, patch_size, step_size=scale_factor)
-        crop_size_dict[train_res] = crop_size_list
         logger.info("List of crop sizes:")
         for i in range(0, len(crop_size_list), 6):
             logger.info(" " + "".join([f"{f'{w} x {h}':14s}" for w, h in crop_size_list[i : i + 6]]))
