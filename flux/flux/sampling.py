@@ -115,6 +115,7 @@ def prepare(t5: HFEmbedder, clip: HFEmbedder, img: Tensor, img_cond: Tensor, pro
     if txt.shape[0] == 1 and bs > 1:
         txt = repeat(txt, "1 ... -> bs ...", bs=bs)
     txt_ids = torch.zeros(bs, txt.shape[1], 3)
+    txt_mask = torch.ones(bs, txt.shape[1], device=txt.device, dtype=torch.int32)
 
     if text_emb is not None:
         vec = torch.stack([item["vec"] for item in text_emb], dim=0).to(img.device)
@@ -133,6 +134,7 @@ def prepare(t5: HFEmbedder, clip: HFEmbedder, img: Tensor, img_cond: Tensor, pro
         "vec": vec.to(img.device),
         "img_mask": img_mask.to(img.device),
         "img_cond_mask": img_cond_mask.to(img.device),
+        "txt_mask": txt_mask.to(txt.device),
     }
 
 

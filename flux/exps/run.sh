@@ -1,23 +1,25 @@
 #!/bin/bash
 
+export WANDB_API_KEY="75de1215548653cdc8084ae0d1450f2d84fd9a20"
 export HF_TOKEN="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"
 export HF_HOME="/data/huggingface"
-train_data_root='configs/data/2M.yaml'
 
+train_data_root='configs/data/2M.yaml'
 batch_size=8
 micro_batch_size=1
 lr=1e-5
 precision=bf16
-image_size=1024
+high_res_list=1024,2048,4096
+high_res_probs=0.5,0.5,0.0
 snr_type=lognorm
 
-exp_name=8_bs${batch_size}_lr${lr}_${precision}_${image_size}px_snr${snr_type}
+exp_name=${high_res_list}_${high_res_probs}
 mkdir -p results/"$exp_name"
 
 # unset NCCL_IB_HCA
 #export TOKENIZERS_PARALLELISM=false
 
-torchrun --nproc_per_node=8 --nnodes=1 train.py \
+torchrun --nproc_per_node=8 --nnodes=1 --master_port 29348 train.py \
     --master_port 18181 \
     --global_bs ${batch_size} \
     --micro_bs ${micro_batch_size} \
@@ -26,11 +28,14 @@ torchrun --nproc_per_node=8 --nnodes=1 train.py \
     --lr ${lr} --grad_clip 2.0 \
     --data_parallel fsdp \
     --max_steps 1000000 \
-    --ckpt_every 1000 --log_every 10 \
+    --ckpt_every 1000 --log_every 1 \
     --precision ${precision} --grad_precision fp32 \
-    --image_size ${image_size} \
     --global_seed 20240826 \
     --num_workers 8 \
     --cache_data_on_disk \
     --snr_type ${snr_type} \
     --checkpointing \
+    --high_res_list ${high_res_list} \
+    --high_res_probs ${high_res_probs} \
+    # --use_wandb
+    

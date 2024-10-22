@@ -86,19 +86,15 @@ class Flux(nn.Module):
         txt_ids: Tensor,
         y: Tensor,
         guidance: Tensor = None,
+        txt_mask: Tensor = None,
         img_mask: Tensor = None,
         img_cond_mask: Tensor = None
     ) -> Tensor:
         if img.ndim != 3 or txt.ndim != 3:
             raise ValueError("Input img and txt tensors must have 3 dimensions.")
-        
-        if img_cond is not None:
-            img = torch.cat([img_cond, img], dim=1)
-            img_ids = torch.cat([img_cond_ids, img_ids], dim=1)
-            img_mask = torch.cat([img_cond_mask, img_mask], dim=1)
-
         # running on sequences img
         img = self.img_in(img)
+        img_cond = self.img_in(img_cond)
         vec = self.time_in(timestep_embedding(timesteps, 256))
         if self.params.guidance_embed:
             if guidance is None:
@@ -107,27 +103,28 @@ class Flux(nn.Module):
         vec = vec + self.vector_in(y)
         txt = self.txt_in(txt)
 
-        ids = torch.cat((txt_ids, img_ids), dim=1)
+        ids = torch.cat((img_cond_ids, txt_ids, img_ids), dim=1)
         pe = self.pe_embedder(ids)
 
         token_select_list = []
         token_logits_list = []
         for block in self.double_blocks:
-            img, txt, sub_token_select, token_logits = block(img=img, txt=txt, vec=vec, pe=pe, img_mask=img_mask)
+            img, txt, img_cond, sub_token_select, token_logits = block(img=img, txt=txt, vec=vec, pe=pe, img_mask=img_mask, txt_mask=txt_mask, cond=img_cond, cond_mask=img_cond_mask)
             if (sub_token_select is not None) and (token_logits is not None):
                 token_select_list.append(sub_token_select)
                 token_logits_list.append(token_logits)
 
-        img = torch.cat((txt, img), 1)
+        img = torch.cat((img_cond, txt, img), 1)
+        attn_mask = torch.cat((img_cond_mask, txt_mask, img_mask), 1)
         for block in self.single_blocks:
-            img, sub_token_select, token_logits = block(img, vec=vec, pe=pe, img_mask=img_mask)
+            img, sub_token_select, token_logits = block(img, vec=vec, pe=pe, attn_mask=attn_mask)
             if (sub_token_select is not None) and (token_logits is not None):
                 token_select_list.append(sub_token_select)
                 token_logits_list.append(token_logits)
-        img = img[:, txt.shape[1] :, ...]
-        
+                
         if img_cond is not None:
             img = img[:, img_cond.shape[1] :, ...]
+        img = img[:, txt.shape[1] :, ...]
         
         token_select = torch.stack(token_select_list, dim=1) if len(token_select_list) > 0 else None
         token_logits = torch.stack(token_logits_list, dim=1) if len(token_logits_list) > 0 else None

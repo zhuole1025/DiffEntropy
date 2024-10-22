@@ -2,24 +2,24 @@
 
 export WANDB_API_KEY="75de1215548653cdc8084ae0d1450f2d84fd9a20"
 export HF_TOKEN="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"
-# export HF_HOME="/data/huggingface"
-train_data_root='configs/data/2M.yaml'
+export HF_HOME="/data/huggingface"
 
-batch_size=8
+train_data_root='configs/data/2M.yaml'
+batch_size=4
 micro_batch_size=1
 lr=1e-5
 precision=bf16
-high_res_list=1024,2048,4096
-high_res_probs=0.5,0.5,0.0
+high_res_list=1024
+high_res_probs=1.0
 snr_type=lognorm
 
-exp_name=${high_res_list}_${high_res_probs}_wo_drop
+exp_name=${high_res_list}_${high_res_probs}
 mkdir -p results/"$exp_name"
 
 # unset NCCL_IB_HCA
 #export TOKENIZERS_PARALLELISM=false
 
-torchrun --nproc_per_node=8 --nnodes=1 --master_port 29348 train.py \
+torchrun --nproc_per_node=4 --nnodes=1 --master_port 29348 train.py \
     --master_port 18181 \
     --global_bs ${batch_size} \
     --micro_bs ${micro_batch_size} \
@@ -37,5 +37,5 @@ torchrun --nproc_per_node=8 --nnodes=1 --master_port 29348 train.py \
     --checkpointing \
     --high_res_list ${high_res_list} \
     --high_res_probs ${high_res_probs} \
-    --use_wandb
+    # --use_wandb
     

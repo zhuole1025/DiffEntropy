@@ -32,7 +32,7 @@ class ItemProcessor(ABC):
 
 
 class MyDataset(Dataset):
-    def __init__(self, config_path, train_res, item_processor: ItemProcessor, cache_on_disk=False):
+    def __init__(self, config_path, item_processor: ItemProcessor, train_res=None, cache_on_disk=False):
         logger.info(f"read dataset config from {config_path}")
         with open(config_path, "r") as f:
             self.config = yaml.load(f, Loader=yaml.FullLoader)
@@ -54,8 +54,9 @@ class MyDataset(Dataset):
         self.group_indices = {key: list(range(val[0], val[1])) for key, val in group_indice_range.items()}
         self.item_processor = item_processor
         
-        self.train_res = train_res
-        self.ann = self.filter_images()
+        if train_res is not None:
+            self.train_res = train_res
+            self.ann = self.filter_images()
 
         logger.info(f"total length: {len(self)}")
 

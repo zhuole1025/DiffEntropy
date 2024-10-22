@@ -1,5 +1,5 @@
 META:
   -
-    path: '/home/ubuntu/zl/DiffEntropy/krea_900k_filtered.json'
+    path: '/data/DiffEntropy/krea_2M_full_filtered.json'
     type: 'image_text'
-    root: '/home/ubuntu/goosedata/images'
+    root: '/goosedata/images'

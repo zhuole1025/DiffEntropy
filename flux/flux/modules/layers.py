@@ -9,27 +9,6 @@ import torch.nn.functional as F
 from flux.math import attention, rope
 
 
-def expand_attn_mask(
-    hidden_states: torch.Tensor,
-    attn_mask: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Expand a mask so that the text mask is included.
-    """
-    bsz = attn_mask.shape[0]
-    assert bsz == hidden_states.shape[0]
-    residual_seq_len = hidden_states.shape[2] # Note: hidden_states is of shape (bsz, num_heads, seq_len, head_dim)
-    mask_seq_len = attn_mask.shape[1]
-    
-    expanded_mask = torch.ones(bsz, residual_seq_len, dtype=attn_mask.dtype, device=attn_mask.device)
-    start_index = residual_seq_len - mask_seq_len
-    expanded_mask[:, start_index:] = attn_mask
-    
-    # expanded_mask = (expanded_mask > 0)
-
-    return expanded_mask
-
-
 def _gumbel_sigmoid(
     logits, tau=1, hard=False, eps=1e-10, training=True, threshold=0.5
 ):
@@ -288,6 +267,7 @@ class DoubleStreamBlock(nn.Module):
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         self.num_heads = num_heads
         self.hidden_size = hidden_size
+        
         self.img_mod = Modulation(hidden_size, double=True)
         self.img_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.img_attn = SelfAttention(dim=hidden_size, num_heads=num_heads, qkv_bias=qkv_bias)
@@ -310,16 +290,35 @@ class DoubleStreamBlock(nn.Module):
             nn.Linear(mlp_hidden_dim, hidden_size, bias=True),
         )
         
+        self.cond_mod = Modulation(hidden_size, double=True)
+        self.cond_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.cond_attn = SelfAttention(dim=hidden_size, num_heads=num_heads, qkv_bias=qkv_bias)
+
+        self.cond_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.cond_mlp = nn.Sequential(
+            nn.Linear(hidden_size, mlp_hidden_dim, bias=True),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(mlp_hidden_dim, hidden_size, bias=True),
+        )
+        
         self.attn_token_select = None
         self.mlp_token_select = None
         if attn_token_select:
             self.attn_token_select = TDRouter(hidden_size)
         # if mlp_token_select:
         #     self.mlp_token_select = TDRouter(hidden_size)
+    
+    def init_cond_weights(self):
+        self.cond_mod.load_state_dict(self.img_mod.state_dict())
+        self.cond_norm1.load_state_dict(self.img_norm1.state_dict())
+        self.cond_norm2.load_state_dict(self.img_norm2.state_dict())
+        self.cond_attn.load_state_dict(self.img_attn.state_dict())
+        self.cond_mlp.load_state_dict(self.img_mlp.state_dict())
 
-    def forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor, img_mask: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor, img_mask: Tensor, txt_mask: Tensor, cond: Tensor, cond_mask: Tensor) -> tuple[Tensor, Tensor]:
         img_mod1, img_mod2 = self.img_mod(vec)
         txt_mod1, txt_mod2 = self.txt_mod(vec)
+        cond_mod1, cond_mod2 = self.cond_mod(vec)
 
         # prepare image for attention
         img_modulated = self.img_norm1(img)
@@ -359,18 +358,25 @@ class DoubleStreamBlock(nn.Module):
         txt_q, txt_k, txt_v = rearrange(txt_qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
         txt_q, txt_k = self.txt_attn.norm(txt_q, txt_k, txt_v)
         
+        # prepare cond for attention
+        cond_modulated = self.cond_norm1(cond)
+        cond_modulated = (1 + cond_mod1.scale) * cond_modulated + cond_mod1.shift
+        cond_qkv = self.cond_attn.qkv(cond_modulated)
+        cond_q, cond_k, cond_v = rearrange(cond_qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
+        cond_q, cond_k = self.cond_attn.norm(cond_q, cond_k, cond_v)
+        
         # run actual attention
-        q = torch.cat((txt_q, img_q), dim=2)
-        k = torch.cat((txt_k, img_k), dim=2)
-        v = torch.cat((txt_v, img_v), dim=2)
+        q = torch.cat((cond_q, txt_q, img_q), dim=2)
+        k = torch.cat((cond_k, txt_k, img_k), dim=2)
+        v = torch.cat((cond_v, txt_v, img_v), dim=2)
         
         if img_mask is not None:
-            attn_mask = expand_attn_mask(q, img_mask)
-            drop_mask = expand_attn_mask(k, drop_mask)
+            attn_mask = torch.cat((cond_mask, txt_mask, img_mask), dim=1)
+            drop_mask = torch.cat((cond_mask, txt_mask, drop_mask), dim=1)
             
         with torch.cuda.device(q.device.index):
             attn = attention(q, k, v, pe_q=pe, pe_k=pe_k, attn_mask=attn_mask, drop_mask=drop_mask)
-        txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1] :]
+        cond_attn, txt_attn, img_attn = attn.split((cond.shape[1], txt.shape[1], img.shape[1]), dim=1)
 
         # calculate the img bloks
         img = img + img_mod1.gate * self.img_attn.proj(img_attn)
@@ -406,7 +412,12 @@ class DoubleStreamBlock(nn.Module):
         # calculate the txt bloks
         txt = txt + txt_mod1.gate * self.txt_attn.proj(txt_attn)
         txt = txt + txt_mod2.gate * self.txt_mlp((1 + txt_mod2.scale) * self.txt_norm2(txt) + txt_mod2.shift)
-        return img, txt, sub_token_select, token_logits
+        
+        # calculate the cond blocks
+        cond = cond + cond_mod1.gate * self.cond_attn.proj(cond_attn)
+        cond = cond + cond_mod2.gate * self.cond_mlp((1 + cond_mod2.scale) * self.cond_norm2(cond) + cond_mod2.shift)
+        
+        return img, txt, cond, sub_token_select, token_logits
 
 
 class SingleStreamBlock(nn.Module):
@@ -448,7 +459,7 @@ class SingleStreamBlock(nn.Module):
         if attn_token_select:
             self.attn_token_select = TDRouter(hidden_size)
         
-    def forward(self, x: Tensor, vec: Tensor, pe: Tensor, img_mask: Tensor) -> Tensor:
+    def forward(self, x: Tensor, vec: Tensor, pe: Tensor, attn_mask: Tensor) -> Tensor:
         
         mod, _ = self.modulation(vec)
         x_mod = (1 + mod.scale) * self.pre_norm(x) + mod.shift
@@ -456,9 +467,6 @@ class SingleStreamBlock(nn.Module):
 
         q, k, v = rearrange(qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
         q, k = self.norm(q, k, v)
-        
-        if img_mask is not None:
-            attn_mask = expand_attn_mask(q, img_mask)
         
         pe_k = pe.clone()
         if self.attn_token_select:
@@ -485,10 +493,6 @@ class SingleStreamBlock(nn.Module):
         # compute activation in mlp stream, cat again and run second linear layer
         output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
         
-        # apply token select if it exists
-        # if self.mlp_token_select:
-            # sub_token_select, token_logits = self.joint_token_select(x)
-        # else:
         sub_token_select, token_logits = None, None
         
         return x + mod.gate * output, sub_token_select, token_logits

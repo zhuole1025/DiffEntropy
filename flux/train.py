@@ -335,11 +335,21 @@ def main(args):
         clip = None
     
     model = load_flow_model("flux-dev", device=device_str, dtype=torch.bfloat16, attn_token_select=args.attn_token_select, mlp_token_select=args.mlp_token_select)
+    for block in model.double_blocks:
+        block.init_cond_weights()
+    model_params = []
+    for name, param in model.named_parameters():
+        if "cond" in name:
+            print(name)
+            param.requires_grad = True
+            model_params.append(param)
+        else:
+            param.requires_grad = False
     ae = AutoencoderKL.from_pretrained(f"black-forest-labs/FLUX.1-dev", subfolder="vae", torch_dtype=torch.bfloat16).to(device)
     ae.requires_grad_(False)
     total_params = model.parameter_count()
     size_in_gb = total_params * 4 / 1e9
-    logger.info(f"Model Size: {size_in_gb:.2f} GB, Total Parameters: {total_params / 1e9:.2f} B")
+    logger.info(f"Model Size: {size_in_gb:.2f} GB, Total Parameters: {total_params / 1e9:.2f} B, Trainable Parameters: {sum(p.numel() for p in model_params) / 1e9:.2f} B")
 
     if args.auto_resume and args.resume is None:
         try:
@@ -442,7 +452,10 @@ def main(args):
 
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant
     # learning rate of 1e-4 in our paper):
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
+    if len(model_params) > 0:
+        opt = torch.optim.AdamW(model_params, lr=args.lr, weight_decay=args.wd)
+    else:
+        opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     if args.resume:
         opt_state_world_size = len(
             [x for x in os.listdir(args.resume) if x.startswith("optimizer.") and x.endswith(".pth")]
@@ -512,7 +525,7 @@ def main(args):
         )
         dataset = MyDataset(
             args.data_path,
-            train_res,
+            train_res=train_res,
             item_processor=T2IItemProcessor(image_transform),
             cache_on_disk=args.cache_data_on_disk,
         )
@@ -550,7 +563,6 @@ def main(args):
     model.train()
 
     # Variables for monitoring/logging purposes:
-
     logger.info(f"Training for {args.max_steps:,} steps...")
 
     start_time = time()
@@ -596,6 +608,7 @@ def main(args):
                 img_cond_ids=inp["img_cond_ids"][mb_st:mb_ed],
                 txt=inp["txt"][mb_st:mb_ed],
                 txt_ids=inp["txt_ids"][mb_st:mb_ed],
+                txt_mask=inp["txt_mask"][mb_st:mb_ed],
                 y=inp["vec"][mb_st:mb_ed],
                 img_mask=inp["img_mask"][mb_st:mb_ed],
                 img_cond_mask=inp["img_cond_mask"][mb_st:mb_ed],
