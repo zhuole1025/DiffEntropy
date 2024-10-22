@@ -110,7 +110,6 @@ class ode:
             return model_output
 
         t = self.t.to(device)
-        print(t.shape)
         atol = [self.atol] * len(x) if isinstance(x, tuple) else [self.atol]
         rtol = [self.rtol] * len(x) if isinstance(x, tuple) else [self.rtol]
         samples = odeint(_fn, x, t, method=self.sampler_type, atol=atol, rtol=rtol)

@@ -154,16 +154,21 @@ def main(args, rank, master_port):
                     
                     with torch.no_grad():
                         x_cond = (ae.encode(x_cond[None].to(ae.dtype)).latent_dist.sample()[0] - ae.config.shift_factor) * ae.config.scaling_factor
-                    x_cond = torch.stack([x_cond, torch.zeros_like(x_cond, device=x_cond.device, dtype=x_cond.dtype)])
+                    x_cond = torch.stack([x_cond, torch.zeros_like(x_cond, device=x_cond.device, dtype=x_cond.dtype), torch.zeros_like(x_cond, device=x_cond.device, dtype=x_cond.dtype)])
                         
                     up_scale = high_res // low_res
                     low_h, low_w = x_cond.shape[-2:]
                     h, w = low_h * up_scale, low_w * up_scale
                     n = len(caps_list)
                     x = torch.randn([1, 16, h, w], device=device_str).to(dtype)
-                    x = x.repeat(n * 2, 1, 1, 1)
+                    x = x.repeat(n * 3, 1, 1, 1)
                     with torch.no_grad():
-                        inp = prepare(t5=t5, clip=clip, img=x, img_cond=x_cond, prompt=[caps_list] + [""], proportion_empty_prompts=0.0, proportion_empty_images=0.0)
+                        inp = prepare(t5=t5, clip=clip, img=x, img_cond=x_cond, prompt=[caps_list] + [caps_list] + [""], proportion_empty_prompts=0.0, proportion_empty_images=0.0)
+                    
+                    if args.drop_cond:
+                        inp["img_cond"] = None
+                        inp["img_cond_ids"] = None
+                        inp["img_cond_mask"] = None
 
                     model_kwargs = dict(txt=inp["txt"], txt_ids=inp["txt_ids"], y=inp["vec"], img_ids=inp["img_ids"], img_cond_ids=inp["img_cond_ids"], img_cond=inp["img_cond"], img_mask=inp["img_mask"], img_cond_mask=inp["img_cond_mask"], guidance=torch.full((x.shape[0],), 4.0, device=x.device, dtype=x.dtype), txt_cfg_scale=args.txt_cfg_scale, img_cfg_scale=args.img_cfg_scale)
 
@@ -176,11 +181,12 @@ def main(args, rank, master_port):
                     samples = (samples + 1.0) / 2.0
                     samples.clamp_(0.0, 1.0)
                     
-                    x_cond = inp["img_cond"][:1]
-                    x_cond = rearrange(x_cond, "b (h w) (c ph pw) -> b c (h ph) (w pw)", ph=2, pw=2, h=low_h//2, w=low_w//2)
-                    x_cond = ae.decode(x_cond / ae.config.scaling_factor + ae.config.shift_factor)[0]
-                    x_cond = (x_cond + 1.0) / 2.0
-                    x_cond.clamp_(0.0, 1.0)
+                    if not args.drop_cond:
+                        x_cond = inp["img_cond"][:1]
+                        x_cond = rearrange(x_cond, "b (h w) (c ph pw) -> b c (h ph) (w pw)", ph=2, pw=2, h=low_h//2, w=low_w//2)
+                        x_cond = ae.decode(x_cond / ae.config.scaling_factor + ae.config.shift_factor)[0]
+                        x_cond = (x_cond + 1.0) / 2.0
+                        x_cond.clamp_(0.0, 1.0)
 
                     # Save samples to disk as individual .png files
                     for i, (sample, cap) in enumerate(zip(samples, caps_list)):
@@ -188,9 +194,10 @@ def main(args, rank, master_port):
                         save_path = f"{args.image_save_path}/images/{args.solver}_{args.num_sampling_steps}_{sample_id}.png"
                         img.save(save_path)
                         
-                        low_img = to_pil_image(x_cond[i].float())
-                        low_save_path = f"{args.image_save_path}/cond_images/{args.solver}_{args.num_sampling_steps}_{sample_id}_low.png"
-                        low_img.save(low_save_path)
+                        if not args.drop_cond:
+                            low_img = to_pil_image(x_cond[i].float())
+                            low_save_path = f"{args.image_save_path}/cond_images/{args.solver}_{args.num_sampling_steps}_{sample_id}_low.png"
+                            low_img.save(low_save_path)
                         
                         info.append(
                             {
@@ -299,6 +306,7 @@ if __name__ == "__main__":
         default=1e-3,
         help="Relative tolerance for the ODE solver.",
     )
+    parser.add_argument("--drop_cond", action="store_true")
     parser.add_argument("--resolution", type=str, default="1024:1024x1024")
     parser.add_argument("--do_shift", default=True)
     parser.add_argument("--attn_token_select", action="store_true")

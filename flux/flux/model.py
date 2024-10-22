@@ -92,9 +92,10 @@ class Flux(nn.Module):
         if img.ndim != 3 or txt.ndim != 3:
             raise ValueError("Input img and txt tensors must have 3 dimensions.")
         
-        img = torch.cat([img_cond, img], dim=1)
-        img_ids = torch.cat([img_cond_ids, img_ids], dim=1)
-        img_mask = torch.cat([img_cond_mask, img_mask], dim=1)
+        if img_cond is not None:
+            img = torch.cat([img_cond, img], dim=1)
+            img_ids = torch.cat([img_cond_ids, img_ids], dim=1)
+            img_mask = torch.cat([img_cond_mask, img_mask], dim=1)
 
         # running on sequences img
         img = self.img_in(img)
@@ -124,7 +125,9 @@ class Flux(nn.Module):
                 token_select_list.append(sub_token_select)
                 token_logits_list.append(token_logits)
         img = img[:, txt.shape[1] :, ...]
-        img = img[:, img_cond.shape[1] :, ...]
+        
+        if img_cond is not None:
+            img = img[:, img_cond.shape[1] :, ...]
         
         token_select = torch.stack(token_select_list, dim=1) if len(token_select_list) > 0 else None
         token_logits = torch.stack(token_logits_list, dim=1) if len(token_logits_list) > 0 else None
@@ -148,13 +151,13 @@ class Flux(nn.Module):
         txt_cfg_scale: float = 1.0,
         img_cfg_scale: float = 1.0,
     ) -> Tensor:
-        half = img[: len(img) // 2]
-        combined = torch.cat([half, half], dim=0)
+        half = img[: len(img) // 3]
+        combined = torch.cat([half, half, half], dim=0)
         model_out, _, _ = self.forward(combined, timesteps, img_ids, img_cond, img_cond_ids, txt, txt_ids, y, guidance, img_mask, img_cond_mask)
 
-        cond_eps, uncond_eps = torch.split(model_out, len(model_out) // 2, dim=0)
-        half_eps = uncond_eps + txt_cfg_scale * (cond_eps - uncond_eps)
-        eps = torch.cat([half_eps, half_eps], dim=0)
+        cond_v, txt_cond_v, uncond_v = torch.split(model_out, len(model_out) // 3, dim=0)
+        cond_v = txt_cond_v + txt_cfg_scale * (cond_v - txt_cond_v)
+        eps = torch.cat([cond_v, txt_cond_v, uncond_v], dim=0)
         return eps
 
     def parameter_count(self) -> int:
