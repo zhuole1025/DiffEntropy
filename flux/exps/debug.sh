@@ -19,7 +19,7 @@ mkdir -p results/"$exp_name"
 # unset NCCL_IB_HCA
 #export TOKENIZERS_PARALLELISM=false
 
-torchrun --nproc_per_node=4 --nnodes=1 --master_port 29348 train.py \
+CUDA_VISIBLE_DEVICES=4 torchrun --nproc_per_node=1 --nnodes=1 --master_port 29338 train.py \
     --master_port 18181 \
     --global_bs ${batch_size} \
     --micro_bs ${micro_batch_size} \
@@ -37,5 +37,6 @@ torchrun --nproc_per_node=4 --nnodes=1 --master_port 29348 train.py \
     --checkpointing \
     --high_res_list ${high_res_list} \
     --high_res_probs ${high_res_probs} \
+    --zero_init \
     # --use_wandb
     

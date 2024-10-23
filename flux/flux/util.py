@@ -44,6 +44,7 @@ configs = {
             guidance_embed=True,
             attn_token_select=False,
             mlp_token_select=False,
+            zero_init=False,
         ),
         ae_path=os.getenv("AE"),
         ae_params=AutoEncoderParams(
@@ -78,6 +79,7 @@ configs = {
             guidance_embed=False,
             attn_token_select=False,
             mlp_token_select=False,
+            zero_init=False,
         ),
         ae_path=os.getenv("AE"),
         ae_params=AutoEncoderParams(
@@ -106,12 +108,13 @@ def print_load_warning(missing: list[str], unexpected: list[str]) -> None:
         print(f"Got {len(unexpected)} unexpected keys:\n\t" + "\n\t".join(unexpected))
 
 
-def load_flow_model(name: str, device: str | torch.device = "cuda", dtype=torch.float32, hf_download: bool = True, attn_token_select: bool = False, mlp_token_select: bool = False):
+def load_flow_model(name: str, device: str | torch.device = "cuda", dtype=torch.float32, hf_download: bool = True, attn_token_select: bool = False, mlp_token_select: bool = False, zero_init: bool = False):
     # Loading Flux
     print("Init model")
     params = configs[name].params
     params.attn_token_select = attn_token_select
     params.mlp_token_select = mlp_token_select
+    params.zero_init = zero_init
     ckpt_path = configs[name].ckpt_path
     if ckpt_path is None and configs[name].repo_id is not None and configs[name].repo_flow is not None and hf_download:
         ckpt_path = hf_hub_download(configs[name].repo_id, configs[name].repo_flow)

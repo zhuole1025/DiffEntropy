@@ -55,6 +55,7 @@ def main(args, rank, master_port):
     params = configs[args.model].params
     params.attn_token_select = args.attn_token_select
     params.mlp_token_select = args.mlp_token_select
+    params.zero_init = train_args.zero_init
     with torch.device(device_str):
         model = Flux(params).to(dtype)
 
@@ -170,7 +171,19 @@ def main(args, rank, master_port):
                         inp["img_cond_ids"] = None
                         inp["img_cond_mask"] = None
 
-                    model_kwargs = dict(txt=inp["txt"], txt_ids=inp["txt_ids"], y=inp["vec"], img_ids=inp["img_ids"], img_cond_ids=inp["img_cond_ids"], img_cond=inp["img_cond"], img_mask=inp["img_mask"], img_cond_mask=inp["img_cond_mask"], guidance=torch.full((x.shape[0],), 4.0, device=x.device, dtype=x.dtype), txt_cfg_scale=args.txt_cfg_scale, img_cfg_scale=args.img_cfg_scale)
+                    model_kwargs = dict(
+                        txt=inp["txt"], 
+                        txt_ids=inp["txt_ids"], 
+                        txt_mask=inp["txt_mask"],
+                        y=inp["vec"], 
+                        img_ids=inp["img_ids"], 
+                        img_cond_ids=inp["img_cond_ids"], 
+                        img_cond=inp["img_cond"], 
+                        img_mask=inp["img_mask"], 
+                        img_cond_mask=inp["img_cond_mask"], 
+                        guidance=torch.full((x.shape[0],), 4.0, device=x.device, dtype=x.dtype), txt_cfg_scale=args.txt_cfg_scale, 
+                        img_cfg_scale=args.img_cfg_scale
+                    )
 
                     samples = sample_fn(
                         inp["img"], model.forward_with_cfg, **model_kwargs
@@ -190,14 +203,15 @@ def main(args, rank, master_port):
 
                     # Save samples to disk as individual .png files
                     for i, (sample, cap) in enumerate(zip(samples, caps_list)):
+                        
                         img = to_pil_image(sample.float())
-                        save_path = f"{args.image_save_path}/images/{args.solver}_{args.num_sampling_steps}_{sample_id}.png"
-                        img.save(save_path)
+                        save_path = f"{args.image_save_path}/images/{args.solver}_{args.num_sampling_steps}_{sample_id}.jpg"
+                        img.save(save_path, format='JPEG', quality=95)
                         
                         if not args.drop_cond:
                             low_img = to_pil_image(x_cond[i].float())
-                            low_save_path = f"{args.image_save_path}/cond_images/{args.solver}_{args.num_sampling_steps}_{sample_id}_low.png"
-                            low_img.save(low_save_path)
+                            low_save_path = f"{args.image_save_path}/cond_images/{args.solver}_{args.num_sampling_steps}_{sample_id}_low.jpg"
+                            low_img.save(low_save_path, format='JPEG', quality=95)
                         
                         info.append(
                             {
@@ -248,7 +262,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--num_gpus", type=int, default=1)
     parser.add_argument("--ema", action="store_true", help="Use EMA models.")
-    # parser.set_defaults(ema=True)
+    parser.set_defaults(ema=True)
     parser.add_argument(
         "--image_save_path",
         type=str,

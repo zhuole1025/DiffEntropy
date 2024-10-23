@@ -334,17 +334,20 @@ def main(args):
     else:
         clip = None
     
-    model = load_flow_model("flux-dev", device=device_str, dtype=torch.bfloat16, attn_token_select=args.attn_token_select, mlp_token_select=args.mlp_token_select)
+    model = load_flow_model("flux-dev", device=device_str, dtype=torch.bfloat16, attn_token_select=args.attn_token_select, mlp_token_select=args.mlp_token_select, zero_init=args.zero_init)
     for block in model.double_blocks:
         block.init_cond_weights()
     model_params = []
     for name, param in model.named_parameters():
-        if "cond" in name:
-            print(name)
+        if args.full_model:
+            param.requires_grad = True
+            model_params.append(param)
+        elif "cond" in name or 'norm' in name or 'bias' in name:
             param.requires_grad = True
             model_params.append(param)
         else:
             param.requires_grad = False
+    
     ae = AutoencoderKL.from_pretrained(f"black-forest-labs/FLUX.1-dev", subfolder="vae", torch_dtype=torch.bfloat16).to(device)
     ae.requires_grad_(False)
     total_params = model.parameter_count()
@@ -826,10 +829,12 @@ if __name__ == "__main__":
         default="0.2,0.7,0.1",
         help="Comma-separated list of probabilities for sampling low resolution images."
     )
+    parser.add_argument("--full_model", action="store_true")
     parser.add_argument("--token_target_ratio", type=float, default=0.5)
     parser.add_argument("--token_loss_weight", type=float, default=1.0)
     parser.add_argument("--attn_token_select", action="store_true")
     parser.add_argument("--mlp_token_select", action="store_true")
+    parser.add_argument("--zero_init", action="store_true")
     parser.add_argument("--use_wandb", action="store_true")
     args = parser.parse_args()
     args.low_res_list = [int(res) for res in args.low_res_list.split(",")]

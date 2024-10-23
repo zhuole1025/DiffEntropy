@@ -261,7 +261,7 @@ class Modulation(nn.Module):
 
 
 class DoubleStreamBlock(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float, qkv_bias: bool = False, attn_token_select: bool = False, mlp_token_select: bool = False):
+    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float, qkv_bias: bool = False, attn_token_select: bool = False, mlp_token_select: bool = False, zero_init: bool = False):
         super().__init__()
 
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
@@ -300,6 +300,12 @@ class DoubleStreamBlock(nn.Module):
             nn.GELU(approximate="tanh"),
             nn.Linear(mlp_hidden_dim, hidden_size, bias=True),
         )
+        
+        self.zero_init = zero_init
+        if zero_init:
+            self.cond_gate_q = nn.Parameter(torch.zeros([num_heads]))
+            self.cond_gate_k = nn.Parameter(torch.zeros([num_heads]))
+            self.cond_gate_v = nn.Parameter(torch.zeros([num_heads]))
         
         self.attn_token_select = None
         self.mlp_token_select = None
@@ -365,6 +371,11 @@ class DoubleStreamBlock(nn.Module):
         cond_q, cond_k, cond_v = rearrange(cond_qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
         cond_q, cond_k = self.cond_attn.norm(cond_q, cond_k, cond_v)
         
+        if self.zero_init:
+            cond_q = cond_q * self.cond_gate_q.tanh().view(1, -1, 1, 1)
+            cond_k = cond_k * self.cond_gate_k.tanh().view(1, -1, 1, 1)
+            cond_v = cond_v * self.cond_gate_v.tanh().view(1, -1, 1, 1)
+        
         # run actual attention
         q = torch.cat((cond_q, txt_q, img_q), dim=2)
         k = torch.cat((cond_k, txt_k, img_k), dim=2)
@@ -373,7 +384,7 @@ class DoubleStreamBlock(nn.Module):
         if img_mask is not None:
             attn_mask = torch.cat((cond_mask, txt_mask, img_mask), dim=1)
             drop_mask = torch.cat((cond_mask, txt_mask, drop_mask), dim=1)
-            
+        
         with torch.cuda.device(q.device.index):
             attn = attention(q, k, v, pe_q=pe, pe_k=pe_k, attn_mask=attn_mask, drop_mask=drop_mask)
         cond_attn, txt_attn, img_attn = attn.split((cond.shape[1], txt.shape[1], img.shape[1]), dim=1)

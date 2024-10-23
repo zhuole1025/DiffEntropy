@@ -23,6 +23,7 @@ class FluxParams:
     guidance_embed: bool
     attn_token_select: bool
     mlp_token_select: bool
+    zero_init: bool
 
 
 class Flux(nn.Module):
@@ -61,6 +62,7 @@ class Flux(nn.Module):
                     qkv_bias=params.qkv_bias,
                     attn_token_select=params.attn_token_select,
                     mlp_token_select=params.mlp_token_select,
+                    zero_init=params.zero_init,
                 )
                 for _ in range(params.depth)
             ]
@@ -141,6 +143,7 @@ class Flux(nn.Module):
         img_cond_ids: Tensor,
         txt: Tensor,
         txt_ids: Tensor,
+        txt_mask: Tensor,
         y: Tensor,
         guidance: Tensor = None,
         img_mask: Tensor = None,
@@ -150,7 +153,7 @@ class Flux(nn.Module):
     ) -> Tensor:
         half = img[: len(img) // 3]
         combined = torch.cat([half, half, half], dim=0)
-        model_out, _, _ = self.forward(combined, timesteps, img_ids, img_cond, img_cond_ids, txt, txt_ids, y, guidance, img_mask, img_cond_mask)
+        model_out, _, _ = self.forward(combined, timesteps, img_ids, img_cond, img_cond_ids, txt, txt_ids, y, guidance, txt_mask, img_mask, img_cond_mask)
 
         cond_v, txt_cond_v, uncond_v = torch.split(model_out, len(model_out) // 3, dim=0)
         cond_v = txt_cond_v + txt_cfg_scale * (cond_v - txt_cond_v)

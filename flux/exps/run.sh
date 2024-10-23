@@ -9,11 +9,13 @@ batch_size=8
 micro_batch_size=1
 lr=1e-5
 precision=bf16
-high_res_list=1024,2048,4096
-high_res_probs=0.5,0.5,0.0
+low_res_list=256
+low_res_probs=1.0
+high_res_list=1024
+high_res_probs=1.0
 snr_type=lognorm
 
-exp_name=${high_res_list}_${high_res_probs}
+exp_name=${high_res_list}_${high_res_probs}_${low_res_list}_${low_res_probs}_full
 mkdir -p results/"$exp_name"
 
 # unset NCCL_IB_HCA
@@ -28,7 +30,7 @@ torchrun --nproc_per_node=8 --nnodes=1 --master_port 29348 train.py \
     --lr ${lr} --grad_clip 2.0 \
     --data_parallel fsdp \
     --max_steps 1000000 \
-    --ckpt_every 1000 --log_every 1 \
+    --ckpt_every 2000 --log_every 10 \
     --precision ${precision} --grad_precision fp32 \
     --global_seed 20240826 \
     --num_workers 8 \
@@ -37,5 +39,8 @@ torchrun --nproc_per_node=8 --nnodes=1 --master_port 29348 train.py \
     --checkpointing \
     --high_res_list ${high_res_list} \
     --high_res_probs ${high_res_probs} \
-    # --use_wandb
+    --low_res_list ${low_res_list} \
+    --low_res_probs ${low_res_probs} \
+    --full_model \
+    --use_wandb 
     
