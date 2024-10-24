@@ -15,7 +15,7 @@ high_res_list=1024
 high_res_probs=1.0
 snr_type=lognorm
 
-exp_name=${high_res_list}_${high_res_probs}_${low_res_list}_${low_res_probs}_full
+exp_name=${high_res_list}_${high_res_probs}_${low_res_list}_${low_res_probs}_full_fix_rope
 mkdir -p results/"$exp_name"
 
 # unset NCCL_IB_HCA

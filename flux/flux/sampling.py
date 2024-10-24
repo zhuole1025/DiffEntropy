@@ -48,9 +48,12 @@ def prepare(t5: HFEmbedder, clip: HFEmbedder, img: Tensor, img_cond: Tensor, pro
         img_ids = torch.zeros(h // 2, w // 2, 3)
         img_ids[..., 1] = img_ids[..., 1] + torch.arange(h // 2)[:, None]
         img_ids[..., 2] = img_ids[..., 2] + torch.arange(w // 2)[None, :]
-        img_cond_ids = img_ids.clone()
-        img_cond_ids[..., 0] = 1
-        img_cond_ids = img_ids[::down_factor, ::down_factor, :]
+        
+        img_cond_ids = torch.zeros(h_cond // 2, w_cond // 2, 3)
+        img_cond_ids[..., 0] = -1
+        img_cond_ids[..., 1] = img_cond_ids[..., 1] + torch.arange(h_cond // 2)[:, None] * down_factor
+        img_cond_ids[..., 2] = img_cond_ids[..., 2] + torch.arange(w_cond // 2)[None, :] * down_factor
+        
         img_ids = repeat(img_ids, "h w c -> b (h w) c", b=bs)
         img_cond_ids = repeat(img_cond_ids, "h w c -> b (h w) c", b=bs)
         img_mask = torch.ones(bs, img.shape[1], device=img.device, dtype=torch.int32)
@@ -74,12 +77,16 @@ def prepare(t5: HFEmbedder, clip: HFEmbedder, img: Tensor, img_cond: Tensor, pro
             c, h, w = img_i.shape
             _, h_cond, w_cond = img_cond_i.shape
             down_factor = h // h_cond
+            
             img_ids = torch.zeros(h // 2, w // 2, 3)
             img_ids[..., 1] = img_ids[..., 1] + torch.arange(h // 2)[:, None]
             img_ids[..., 2] = img_ids[..., 2] + torch.arange(w // 2)[None, :]
-            img_cond_ids = img_ids.clone()
-            img_cond_ids[..., 0] = 1
-            img_cond_ids = img_ids[::down_factor, ::down_factor, :]
+            
+            img_cond_ids = torch.zeros(h_cond // 2, w_cond // 2, 3)
+            img_cond_ids[..., 0] = -1
+            img_cond_ids[..., 1] = img_cond_ids[..., 1] + torch.arange(h_cond // 2)[:, None] * down_factor
+            img_cond_ids[..., 2] = img_cond_ids[..., 2] + torch.arange(w_cond // 2)[None, :] * down_factor
+            
             flat_img_ids = rearrange(img_ids, "h w c -> (h w) c")
             flat_img_cond_ids = rearrange(img_cond_ids, "h w c -> (h w) c")
             flat_img = rearrange(img_i, "c (h ph) (w pw) -> (h w) (c ph pw)", ph=2, pw=2)
