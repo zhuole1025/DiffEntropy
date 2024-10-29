@@ -76,27 +76,34 @@ class Flux(nn.Module):
         )
 
         self.final_layer = LastLayer(self.hidden_size, 1, self.out_channels)
+        
+        # self.img_cond_in = nn.Linear(self.in_channels, self.hidden_size, bias=True)
+        # nn.init.zeros_(self.img_cond_in.weight)
+        # nn.init.zeros_(self.img_cond_in.bias)
 
     def forward(
         self,
         img: Tensor,
         timesteps: Tensor,
         img_ids: Tensor,
-        img_cond: Tensor,
-        img_cond_ids: Tensor,
         txt: Tensor,
         txt_ids: Tensor,
         y: Tensor,
         guidance: Tensor = None,
         txt_mask: Tensor = None,
+        img_cond: Tensor = None,
+        img_cond_ids: Tensor = None,
         img_mask: Tensor = None,
-        img_cond_mask: Tensor = None
+        img_cond_mask: Tensor = None,
+        controls: tuple = None,
     ) -> Tensor:
         if img.ndim != 3 or txt.ndim != 3:
             raise ValueError("Input img and txt tensors must have 3 dimensions.")
+        
         # running on sequences img
         img = self.img_in(img)
-        img_cond = self.img_in(img_cond)
+        # img_cond = self.img_cond_in(img_cond)
+        # img = img + img_cond
         vec = self.time_in(timestep_embedding(timesteps, 256))
         if self.params.guidance_embed:
             if guidance is None:
@@ -105,27 +112,33 @@ class Flux(nn.Module):
         vec = vec + self.vector_in(y)
         txt = self.txt_in(txt)
 
-        ids = torch.cat((img_cond_ids, txt_ids, img_ids), dim=1)
+        ids = torch.cat((txt_ids, img_ids), dim=1)
         pe = self.pe_embedder(ids)
-
+        
         token_select_list = []
         token_logits_list = []
-        for block in self.double_blocks:
+        for idx, block in enumerate(self.double_blocks):
             img, txt, img_cond, sub_token_select, token_logits = block(img=img, txt=txt, vec=vec, pe=pe, img_mask=img_mask, txt_mask=txt_mask, cond=img_cond, cond_mask=img_cond_mask)
             if (sub_token_select is not None) and (token_logits is not None):
                 token_select_list.append(sub_token_select)
                 token_logits_list.append(token_logits)
+                
+            # controlnet residual
+            if controls is not None:
+                img = img + [idx % len(controls)]
 
-        img = torch.cat((img_cond, txt, img), 1)
-        attn_mask = torch.cat((img_cond_mask, txt_mask, img_mask), 1)
+        
+        # pe = pe[:, :, img_cond_ids.shape[1]:, ...]
+        img = torch.cat((txt, img), 1)
+        attn_mask = torch.cat((txt_mask, img_mask), 1)
         for block in self.single_blocks:
             img, sub_token_select, token_logits = block(img, vec=vec, pe=pe, attn_mask=attn_mask)
             if (sub_token_select is not None) and (token_logits is not None):
                 token_select_list.append(sub_token_select)
                 token_logits_list.append(token_logits)
                 
-        if img_cond is not None:
-            img = img[:, img_cond.shape[1] :, ...]
+        # if img_cond is not None:
+            # img = img[:, img_cond.shape[1] :, ...]
         img = img[:, txt.shape[1] :, ...]
         
         token_select = torch.stack(token_select_list, dim=1) if len(token_select_list) > 0 else None
@@ -139,21 +152,36 @@ class Flux(nn.Module):
         img: Tensor,
         timesteps: Tensor,
         img_ids: Tensor,
-        img_cond: Tensor,
-        img_cond_ids: Tensor,
         txt: Tensor,
-        txt_ids: Tensor,
+        txt_ids: Tensor,controls,
         txt_mask: Tensor,
         y: Tensor,
         guidance: Tensor = None,
+        img_cond: Tensor = None,
+        img_cond_ids: Tensor = None,
         img_mask: Tensor = None,
         img_cond_mask: Tensor = None,
+        controls: tuple = None,
         txt_cfg_scale: float = 1.0,
         img_cfg_scale: float = 1.0,
     ) -> Tensor:
         half = img[: len(img) // 3]
         combined = torch.cat([half, half, half], dim=0)
-        model_out, _, _ = self.forward(combined, timesteps, img_ids, img_cond, img_cond_ids, txt, txt_ids, y, guidance, txt_mask, img_mask, img_cond_mask)
+        model_out, _, _ = self.forward(
+            img=combined, 
+            timesteps=timesteps, 
+            img_ids=img_ids, 
+            img_cond=img_cond, 
+            img_cond_ids=img_cond_ids, 
+            txt=txt, 
+            txt_ids=txt_ids, 
+            y=y, 
+            guidance=guidance, 
+            txt_mask=txt_mask, 
+            img_mask=img_mask, 
+            img_cond_mask=img_cond_mask, 
+            controls=controls
+        )
 
         cond_v, txt_cond_v, uncond_v = torch.split(model_out, len(model_out) // 3, dim=0)
         cond_v = txt_cond_v + txt_cfg_scale * (cond_v - txt_cond_v)

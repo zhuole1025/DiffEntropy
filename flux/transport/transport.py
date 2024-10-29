@@ -97,7 +97,7 @@ class Transport:
 
         return t0, t1
 
-    def sample(self, x1):
+    def sample(self, x1, snr_type=None):
         """Sampling x0 & t based on shape of x1 (if needed)
         Args:
           x1 - data point; [batch, *dim]
@@ -108,17 +108,20 @@ class Transport:
             x0 = th.randn_like(x1)
         t0, t1 = self.check_interval(self.train_eps, self.sample_eps)
 
-        if self.snr_type.startswith("uniform"):
+        if snr_type is None:
+            snr_type = self.snr_type
+            
+        if snr_type.startswith("uniform"):
             assert t0 == 0.0 and t1 == 1.0, "not implemented."
-            if "_" in self.snr_type:
-                _, t0, t1 = self.snr_type.split("_")
+            if "_" in snr_type:
+                _, t0, t1 = snr_type.split("_")
                 t0, t1 = float(t0), float(t1)
             t = th.rand((len(x1),)) * (t1 - t0) + t0
-        elif self.snr_type == "lognorm":
+        elif snr_type == "lognorm":
             u = th.normal(mean=0.0, std=1.0, size=(len(x1),))
             t = 1 / (1 + th.exp(-u)) * (t1 - t0) + t0
         else:
-            raise NotImplementedError("Not implemented snr_type %s" % self.snr_type)
+            raise NotImplementedError("Not implemented snr_type %s" % snr_type)
 
         if self.do_shift:
             base_shift: float = 0.5
@@ -144,7 +147,7 @@ class Transport:
         b = y1 - m * x1
         return lambda x: m * x + b
 
-    def training_losses(self, model, x1, model_kwargs=None):
+    def training_losses(self, model, x1, model_kwargs=None, controlnet=None, controlnet_kwargs=None):
         """Loss for training the score model
         Args:
         - model: backbone model; could be score, noise, or velocity
@@ -157,6 +160,13 @@ class Transport:
         t, xt, ut = self.path_sampler.plan(t, x0, x1)
         B = len(x0)
         
+        if controlnet is not None:
+            x1_controlnet = controlnet_kwargs.pop("controlnet_cond")
+            t_controlnet, x0_controlnet, x1_controlnet = self.sample(x1_controlnet, snr_type='uniform')
+            t_controlnet, xt_controlnet, ut_controlnet = self.path_sampler.plan(t_controlnet, x0_controlnet, x1_controlnet)
+            controls = controlnet(xt_controlnet, timesteps=1 - t_controlnet, **controlnet_kwargs)
+            model_kwargs["controls"] = controls
+            
         model_output, token_select, token_logits = model(xt, timesteps=1 - t, **model_kwargs)
         model_output = -model_output  # todo check if this is all needed
         

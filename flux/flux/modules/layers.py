@@ -290,16 +290,16 @@ class DoubleStreamBlock(nn.Module):
             nn.Linear(mlp_hidden_dim, hidden_size, bias=True),
         )
         
-        self.cond_mod = Modulation(hidden_size, double=True)
-        self.cond_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.cond_attn = SelfAttention(dim=hidden_size, num_heads=num_heads, qkv_bias=qkv_bias)
+        # self.cond_mod = Modulation(hidden_size, double=True)
+        # self.cond_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        # self.cond_attn = SelfAttention(dim=hidden_size, num_heads=num_heads, qkv_bias=qkv_bias)
 
-        self.cond_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.cond_mlp = nn.Sequential(
-            nn.Linear(hidden_size, mlp_hidden_dim, bias=True),
-            nn.GELU(approximate="tanh"),
-            nn.Linear(mlp_hidden_dim, hidden_size, bias=True),
-        )
+        # self.cond_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        # self.cond_mlp = nn.Sequential(
+        #     nn.Linear(hidden_size, mlp_hidden_dim, bias=True),
+        #     nn.GELU(approximate="tanh"),
+        #     nn.Linear(mlp_hidden_dim, hidden_size, bias=True),
+        # )
         
         self.zero_init = zero_init
         if zero_init:
@@ -321,11 +321,11 @@ class DoubleStreamBlock(nn.Module):
         self.cond_attn.load_state_dict(self.img_attn.state_dict())
         self.cond_mlp.load_state_dict(self.img_mlp.state_dict())
 
-    def forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor, img_mask: Tensor, txt_mask: Tensor, cond: Tensor, cond_mask: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor, img_mask: Tensor, txt_mask: Tensor, cond: Tensor = None, cond_mask: Tensor = None) -> tuple[Tensor, Tensor]:
         img_mod1, img_mod2 = self.img_mod(vec)
         txt_mod1, txt_mod2 = self.txt_mod(vec)
-        cond_mod1, cond_mod2 = self.cond_mod(vec)
-
+        # cond_mod1, cond_mod2 = self.cond_mod(vec)
+        
         # prepare image for attention
         img_modulated = self.img_norm1(img)
         img_modulated = (1 + img_mod1.scale) * img_modulated + img_mod1.shift
@@ -364,30 +364,30 @@ class DoubleStreamBlock(nn.Module):
         txt_q, txt_k, txt_v = rearrange(txt_qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
         txt_q, txt_k = self.txt_attn.norm(txt_q, txt_k, txt_v)
         
-        # prepare cond for attention
-        cond_modulated = self.cond_norm1(cond)
-        cond_modulated = (1 + cond_mod1.scale) * cond_modulated + cond_mod1.shift
-        cond_qkv = self.cond_attn.qkv(cond_modulated)
-        cond_q, cond_k, cond_v = rearrange(cond_qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
-        cond_q, cond_k = self.cond_attn.norm(cond_q, cond_k, cond_v)
+        # # prepare cond for attention
+        # cond_modulated = self.cond_norm1(cond)
+        # cond_modulated = (1 + cond_mod1.scale) * cond_modulated + cond_mod1.shift
+        # cond_qkv = self.cond_attn.qkv(cond_modulated)
+        # cond_q, cond_k, cond_v = rearrange(cond_qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
+        # cond_q, cond_k = self.cond_attn.norm(cond_q, cond_k, cond_v)
         
-        if self.zero_init:
-            cond_q = cond_q * self.cond_gate_q.tanh().view(1, -1, 1, 1)
-            cond_k = cond_k * self.cond_gate_k.tanh().view(1, -1, 1, 1)
-            cond_v = cond_v * self.cond_gate_v.tanh().view(1, -1, 1, 1)
+        # if self.zero_init:
+        #     cond_q = cond_q * self.cond_gate_q.tanh().view(1, -1, 1, 1)
+        #     cond_k = cond_k * self.cond_gate_k.tanh().view(1, -1, 1, 1)
+        #     cond_v = cond_v * self.cond_gate_v.tanh().view(1, -1, 1, 1)
         
         # run actual attention
-        q = torch.cat((cond_q, txt_q, img_q), dim=2)
-        k = torch.cat((cond_k, txt_k, img_k), dim=2)
-        v = torch.cat((cond_v, txt_v, img_v), dim=2)
+        q = torch.cat((txt_q, img_q), dim=2)
+        k = torch.cat((txt_k, img_k), dim=2)
+        v = torch.cat((txt_v, img_v), dim=2)
         
         if img_mask is not None:
-            attn_mask = torch.cat((cond_mask, txt_mask, img_mask), dim=1)
-            drop_mask = torch.cat((cond_mask, txt_mask, drop_mask), dim=1)
+            attn_mask = torch.cat((txt_mask, img_mask), dim=1)
+            drop_mask = torch.cat((txt_mask, drop_mask), dim=1)
         
         with torch.cuda.device(q.device.index):
             attn = attention(q, k, v, pe_q=pe, pe_k=pe_k, attn_mask=attn_mask, drop_mask=drop_mask)
-        cond_attn, txt_attn, img_attn = attn.split((cond.shape[1], txt.shape[1], img.shape[1]), dim=1)
+        txt_attn, img_attn = attn.split((txt.shape[1], img.shape[1]), dim=1)
 
         # calculate the img bloks
         img = img + img_mod1.gate * self.img_attn.proj(img_attn)
@@ -424,9 +424,9 @@ class DoubleStreamBlock(nn.Module):
         txt = txt + txt_mod1.gate * self.txt_attn.proj(txt_attn)
         txt = txt + txt_mod2.gate * self.txt_mlp((1 + txt_mod2.scale) * self.txt_norm2(txt) + txt_mod2.shift)
         
-        # calculate the cond blocks
-        cond = cond + cond_mod1.gate * self.cond_attn.proj(cond_attn)
-        cond = cond + cond_mod2.gate * self.cond_mlp((1 + cond_mod2.scale) * self.cond_norm2(cond) + cond_mod2.shift)
+        # # calculate the cond blocks
+        # cond = cond + cond_mod1.gate * self.cond_attn.proj(cond_attn)
+        # cond = cond + cond_mod2.gate * self.cond_mlp((1 + cond_mod2.scale) * self.cond_norm2(cond) + cond_mod2.shift)
         
         return img, txt, cond, sub_token_select, token_logits
 

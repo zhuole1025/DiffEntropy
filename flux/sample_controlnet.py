@@ -18,6 +18,7 @@ from torchvision import transforms
 from torchvision.transforms.functional import to_pil_image
 from tqdm import tqdm
 
+from flux.controlnet import ControlNetFlux
 from flux.model import Flux, FluxParams
 from flux.sampling import prepare
 from flux.util import configs, load_clip, load_t5, load_flow_model
@@ -51,14 +52,19 @@ def main(args, rank, master_port):
 
     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[args.precision]
 
-    print("Init model")
+    print("Init controlnet")
     params = configs[args.model].params
+    with torch.device(device_str):
+        controlnet = ControlNetFlux(params).to(dtype)
+    controlnet.eval()
+    
+    print("Init model")
     params.attn_token_select = args.attn_token_select
     params.mlp_token_select = args.mlp_token_select
     params.zero_init = train_args.zero_init
     with torch.device(device_str):
         model = Flux(params).to(dtype)
-
+        
     print("Init vae")
     ae = AutoencoderKL.from_pretrained(f"black-forest-labs/FLUX.1-dev", subfolder="vae", torch_dtype=dtype).to(device_str)
     ae.requires_grad_(False)
@@ -67,7 +73,7 @@ def main(args, rank, master_port):
     t5 = load_t5(device_str, max_length=args.max_length)
     clip = load_clip(device_str)
         
-    model.eval().to(device_str, dtype=dtype)
+    # model.eval().to(device_str, dtype=dtype)
 
     if args.debug == False:
         # assert train_args.model_parallel_size == args.num_gpus
@@ -80,6 +86,14 @@ def main(args, rank, master_port):
             )
         )
         model.load_state_dict(ckpt, strict=True)
+        
+        ckpt = torch.load(
+            os.path.join(
+                args.ckpt,
+                f"consolidated_controlnet{'_ema' if args.ema else ''}.{rank:02d}-of-{args.num_gpus:02d}.pth",
+            )
+        )
+        controlnet.load_state_dict(ckpt, strict=True)
         
     # begin sampler
     transport = create_transport(
@@ -189,9 +203,20 @@ def main(args, rank, master_port):
                         guidance=torch.full((x.shape[0],), 4.0, device=x.device, dtype=x.dtype), txt_cfg_scale=args.txt_cfg_scale, 
                         img_cfg_scale=args.img_cfg_scale
                     )
+                    
+                    controlnet_kwargs = dict(
+                        img_ids=inp["img_ids"],
+                        controlnet_cond=inp["img_cond"],
+                        txt=inp["txt"],
+                        txt_ids=inp["txt_ids"],
+                        y=inp["vec"],
+                        txt_mask=inp["txt_mask"],
+                        img_mask=inp["img_mask"],
+                        guidance=torch.full((x.shape[0],), 4.0, device=x.device, dtype=x.dtype),
+                    )
 
                     samples = sample_fn(
-                        inp["img"], model.forward_with_cfg, **model_kwargs
+                        inp["img"], model.forward_with_cfg, model_kwargs, controlnet, controlnet_kwargs
                     )[-1]
                     samples = samples[:1]
                     samples = rearrange(samples, "b (h w) (c ph pw) -> b c (h ph) (w pw)", ph=2, pw=2, h=h//2, w=w//2)
@@ -267,7 +292,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--num_gpus", type=int, default=1)
     parser.add_argument("--ema", action="store_true", help="Use EMA models.")
-    parser.set_defaults(ema=True)
+    # parser.set_defaults(ema=True)
     parser.add_argument(
         "--image_save_path",
         type=str,

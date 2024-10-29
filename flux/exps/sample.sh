@@ -7,18 +7,18 @@ export HF_HOME="/data/huggingface"
 low_res="256"
 high_res="1024"
 t=1
-txt_cfg=4.0
+txt_cfg=0.5
 img_cfg=2.0
 seed=25
 steps=30
 solver=euler
-train_steps=0008000
-model_dir=/data/DiffEntropy/flux/results/1024_1.0_256_1.0_full/checkpoints/${train_steps}
+train_steps=0004000
+model_dir=/data/DiffEntropy/flux/results/1024_1.0_256_1.0_controlnet/checkpoints/${train_steps}
 cap_dir=validation_data.json
-out_dir=samples/full_${train_steps}_txtcfg${txt_cfg}_imgcfg${img_cfg}_steps${steps}_seed${seed}
+out_dir=samples/controlnet_${train_steps}_txtcfg${txt_cfg}_imgcfg${img_cfg}_steps${steps}_seed${seed}
 root_dir=/goosedata/images
 
-CUDA_VISIBLE_DEVICES=4 python -u sample.py --ckpt ${model_dir} \
+CUDA_VISIBLE_DEVICES=3 python -u sample_controlnet.py --ckpt ${model_dir} \
 --image_save_path ${out_dir} \
 --solver ${solver} --num_sampling_steps ${steps} \
 --caption_path ${cap_dir} \

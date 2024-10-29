@@ -9,6 +9,8 @@ batch_size=4
 micro_batch_size=1
 lr=1e-5
 precision=bf16
+low_res_list=256
+low_res_probs=1.0
 high_res_list=1024
 high_res_probs=1.0
 snr_type=lognorm
@@ -19,7 +21,7 @@ mkdir -p results/"$exp_name"
 # unset NCCL_IB_HCA
 #export TOKENIZERS_PARALLELISM=false
 
-CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 --nnodes=1 --master_port 29338 train.py \
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=1 --nnodes=1 --master_port 29338 train_controlnet.py \
     --master_port 18181 \
     --global_bs ${batch_size} \
     --micro_bs ${micro_batch_size} \
@@ -31,12 +33,15 @@ CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 --nnodes=1 --master_port 2933
     --ckpt_every 1000 --log_every 1 \
     --precision ${precision} --grad_precision fp32 \
     --global_seed 20240826 \
-    --num_workers 8 \
+    --num_workers 0 \
     --cache_data_on_disk \
     --snr_type ${snr_type} \
     --checkpointing \
     --high_res_list ${high_res_list} \
     --high_res_probs ${high_res_probs} \
-    --zero_init \
+    --low_res_list ${low_res_list} \
+    --low_res_probs ${low_res_probs} \
+    --debug \
+    # --zero_init \
     # --use_wandb
     

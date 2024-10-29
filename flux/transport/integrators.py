@@ -101,11 +101,14 @@ class ode:
         self.rtol = rtol
         self.sampler_type = sampler_type
 
-    def sample(self, x, model, **model_kwargs):
+    def sample(self, x, model, model_kwargs, controlnet=None, controlnet_kwargs=None):
         device = x[0].device if isinstance(x, tuple) else x.device
 
         def _fn(t, x):
             t = th.ones(x[0].size(0)).to(device) * t if isinstance(x, tuple) else th.ones(x.size(0)).to(device) * t
+            if controlnet is not None:
+                controls = controlnet(x, timesteps=1 - t, **controlnet_kwargs)
+                model_kwargs["controls"] = controls
             model_output = self.drift(x, t, model, **model_kwargs)
             return model_output
 

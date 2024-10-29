@@ -22,6 +22,7 @@ import socket
 from time import time
 import warnings
 from safetensors import safe_open
+from safetensors.torch import load_file
 import wandb
 
 from PIL import Image
@@ -50,7 +51,7 @@ from diffusers import AutoencoderKL
 
 from data import ItemProcessor, MyDataset
 from flux.sampling import prepare
-from flux.util import load_ae, load_clip, load_flow_model, load_t5
+from flux.util import load_ae, load_clip, load_flow_model, load_t5, load_controlnet
 from imgproc import generate_crop_size_list, to_rgb_if_rgba, var_center_crop
 from parallel import distributed_init, get_intra_node_process_group
 from transport import create_transport
@@ -77,8 +78,7 @@ class T2IItemProcessor(ItemProcessor):
             image = Image.open(image_path).convert("RGB")
             text = data_item["gpt_4_caption"]
             if "text_embeddings_path" in data_item:
-                with safe_open(data_item["text_embeddings_path"], framework="pt", device="cpu") as f:
-                    text_emb = {k: f.get_tensor(k) for k in f.keys()}
+                text_emb = load_file(data_item["text_embeddings_path"], device="cpu")
         elif "image_url" in data_item:
             url = data_item["image_url"]
             url = url.replace(
@@ -333,6 +333,10 @@ def main(args):
         logger.info(f"CLIP loaded")
     else:
         clip = None
+        
+    ae = AutoencoderKL.from_pretrained(f"black-forest-labs/FLUX.1-dev", subfolder="vae", torch_dtype=torch.bfloat16).to(device)
+    ae.requires_grad_(False)
+    logger.info(f"VAE loaded")
     
     model = load_flow_model("flux-dev", device=device_str, dtype=torch.bfloat16, attn_token_select=args.attn_token_select, mlp_token_select=args.mlp_token_select, zero_init=args.zero_init)
     # for block in model.double_blocks:
@@ -343,17 +347,19 @@ def main(args):
             param.requires_grad = True
             model_params.append(param)
         # elif "cond" in name or 'norm' in name or 'bias' in name:
-        elif 'double_blocks' in name:
-            param.requires_grad = True
-            model_params.append(param)
+        # elif 'double_blocks' in name:
+            # param.requires_grad = True
+            # model_params.append(param)
         else:
             param.requires_grad = False
     
-    ae = AutoencoderKL.from_pretrained(f"black-forest-labs/FLUX.1-dev", subfolder="vae", torch_dtype=torch.bfloat16).to(device)
-    ae.requires_grad_(False)
+    controlnet = load_controlnet("flux-dev", device=device_str, dtype=torch.bfloat16, transformer=model)
+    controlnet.train()
+    controlnet_params = [p for p in controlnet.parameters() if p.requires_grad]
+    
     total_params = model.parameter_count()
     size_in_gb = total_params * 4 / 1e9
-    logger.info(f"Model Size: {size_in_gb:.2f} GB, Total Parameters: {total_params / 1e9:.2f} B, Trainable Parameters: {sum(p.numel() for p in model_params) / 1e9:.2f} B")
+    logger.info(f"Model Size: {size_in_gb:.2f} GB, Total Parameters: {total_params / 1e9:.2f} B, Trainable Parameters: {sum(p.numel() for p in model_params) / 1e9:.2f} B, ControlNet Trainable Parameters: {sum(p.numel() for p in controlnet_params) / 1e9:.2f} B")
 
     if args.auto_resume and args.resume is None:
         try:
@@ -392,6 +398,16 @@ def main(args):
                 ),
                 strict=True,
             )
+            controlnet.load_state_dict(
+                torch.load(
+                    os.path.join(
+                        args.resume,
+                        f"consolidated_controlnet.{0:02d}-of-{1:02d}.pth",
+                    ),
+                    map_location="cpu",
+                ),
+                strict=True,
+            )
     elif args.init_from:
         if dp_rank == 0:
             logger.info(f"Initializing model weights from: {args.init_from}")
@@ -421,18 +437,33 @@ def main(args):
             logger.info(f"  Size mismatch keys: {size_mismatch_keys}")
             logger.info(f"  Missing keys: {missing_keys}")
             logger.info(f"  Unexpeected keys: {unexpected_keys}")
+            
+            controlnet.load_state_dict(
+                torch.load(
+                    os.path.join(
+                        args.init_from,
+                        f"consolidated_controlnet.{0:02d}-of-{1:02d}.pth",
+                    ),
+                    map_location="cpu",
+                ),
+                strict=True,
+            )
+            
     dist.barrier()
 
     # checkpointing (part1, should be called before FSDP wrapping)
     if args.checkpointing:
         checkpointing_list = list(model.get_checkpointing_wrap_module_list())
         checkpointing_list_ema = list(model_ema.get_checkpointing_wrap_module_list())
+        checkpointing_list_controlnet = list(controlnet.get_checkpointing_wrap_module_list())
     else:
         checkpointing_list = []
         checkpointing_list_ema = []
+        checkpointing_list_controlnet = []
 
     model = setup_fsdp_sync(model, args)
     model_ema = setup_fsdp_sync(model_ema, args)
+    controlnet = setup_fsdp_sync(controlnet, args)
     
     # checkpointing (part2, after FSDP wrapping)
     if args.checkpointing:
@@ -451,13 +482,19 @@ def main(args):
             checkpoint_wrapper_fn=non_reentrant_wrapper,
             check_fn=lambda submodule: submodule in checkpointing_list_ema,
         )
+        apply_activation_checkpointing(
+            controlnet,
+            checkpoint_wrapper_fn=non_reentrant_wrapper,
+            check_fn=lambda submodule: submodule in checkpointing_list_controlnet,
+        )
 
     logger.info(f"model:\n{model}\n")
+    logger.info(f"controlnet:\n{controlnet}\n")
 
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant
     # learning rate of 1e-4 in our paper):
-    if len(model_params) > 0:
-        opt = torch.optim.AdamW(model_params, lr=args.lr, weight_decay=args.wd)
+    if len(model_params) + len(controlnet_params) > 0:
+        opt = torch.optim.AdamW(model_params + controlnet_params, lr=args.lr, weight_decay=args.wd)
     else:
         opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     if args.resume:
@@ -551,6 +588,7 @@ def main(args):
             num_workers=args.num_workers,
             pin_memory=True,
             collate_fn=dataloader_collate_fn,
+            prefetch_factor=3,
         )
 
         data_collection[train_res] = {
@@ -615,8 +653,6 @@ def main(args):
             
             model_kwargs = dict(
                 img_ids=inp["img_ids"][mb_st:mb_ed],
-                img_cond=inp["img_cond"][mb_st:mb_ed],
-                img_cond_ids=inp["img_cond_ids"][mb_st:mb_ed],
                 txt=inp["txt"][mb_st:mb_ed],
                 txt_ids=inp["txt_ids"][mb_st:mb_ed],
                 txt_mask=inp["txt_mask"][mb_st:mb_ed],
@@ -625,29 +661,50 @@ def main(args):
                 img_cond_mask=inp["img_cond_mask"][mb_st:mb_ed],
                 guidance=torch.full((x_mb.shape[0],), 4.0, device=x_mb.device, dtype=x_mb.dtype),
             )
+            
+            controlnet_kwargs = dict(
+                img_ids=inp["img_ids"][mb_st:mb_ed],
+                controlnet_cond=inp["img_cond"][mb_st:mb_ed],
+                txt=inp["txt"][mb_st:mb_ed],
+                txt_ids=inp["txt_ids"][mb_st:mb_ed],
+                y=inp["vec"][mb_st:mb_ed],
+                txt_mask=inp["txt_mask"][mb_st:mb_ed],
+                img_mask=inp["img_mask"][mb_st:mb_ed],
+                guidance=torch.full((x_mb.shape[0],), 4.0, device=x_mb.device, dtype=x_mb.dtype),
+            )
+            
             with {
                 "bf16": torch.cuda.amp.autocast(dtype=torch.bfloat16),
                 "fp16": torch.cuda.amp.autocast(dtype=torch.float16),
                 "fp32": contextlib.nullcontext(),
                 "tf32": contextlib.nullcontext(),
             }[args.precision]:
-                loss_dict = data_pack["transport"].training_losses(model, x_mb, model_kwargs)
+                loss_dict = data_pack["transport"].training_losses(model, x_mb, model_kwargs, controlnet=controlnet, controlnet_kwargs=controlnet_kwargs)
             loss = loss_dict["loss"].sum() / data_pack["local_bsz"]
             loss_item += loss.item()
             with model.no_sync() if args.data_parallel in ["sdp"] and not last_mb else contextlib.nullcontext():
                 loss.backward()
-
-        grad_norm = model.clip_grad_norm_(max_norm=args.grad_clip)
+        
+        if len(model_params) > 0:
+            grad_norm = model.clip_grad_norm_(max_norm=args.grad_clip)
+        else:
+            grad_norm = 0.0
+        if len(controlnet_params) > 0:
+            controlnet_grad_norm = controlnet.clip_grad_norm_(max_norm=args.grad_clip)
+        else:
+            controlnet_grad_norm = 0.0
 
         if tb_logger is not None:
             tb_logger.add_scalar(f"train/loss", loss_item, step)
             tb_logger.add_scalar(f"train/grad_norm", grad_norm, step)
+            tb_logger.add_scalar(f"train/controlnet_grad_norm", controlnet_grad_norm, step)
             tb_logger.add_scalar(f"train/lr", opt.param_groups[0]["lr"], step)
                 
         if args.use_wandb and rank == 0:
             wandb.log({
                 "train/loss": loss_item,
                 "train/grad_norm": grad_norm,
+                "train/controlnet_grad_norm": controlnet_grad_norm,
                 "train/lr": opt.param_groups[0]["lr"],
             }, step=step)
 
@@ -658,9 +715,9 @@ def main(args):
         metrics = data_pack["metrics"]
         metrics["loss"].update(loss_item)
         metrics["grad_norm"].update(grad_norm)
+        metrics["controlnet_grad_norm"].update(controlnet_grad_norm)
         metrics["Secs/Step"].update(end_time - start_time)
         metrics["Imgs/Sec"].update(data_pack["global_bsz"] / (end_time - start_time))
-        metrics["grad_norm"].update(grad_norm)
         if (step + 1) % args.log_every == 0:
             # Measure training speed:
             torch.cuda.synchronize()
@@ -729,6 +786,36 @@ def main(args):
                 torch.save(opt.state_dict(), os.path.join(checkpoint_path, opt_state_fn))
             dist.barrier()
             logger.info(f"Saved optimizer to {checkpoint_path}.")
+            
+            with FSDP.state_dict_type(
+                controlnet,
+                StateDictType.FULL_STATE_DICT,
+                FullStateDictConfig(rank0_only=True, offload_to_cpu=True),
+            ):
+                consolidated_model_state_dict = controlnet.state_dict()
+                if fs_init.get_data_parallel_rank() == 0:
+                    consolidated_fn = (
+                        "consolidated_controlnet."
+                        f"{fs_init.get_model_parallel_rank():02d}-of-"
+                        f"{fs_init.get_model_parallel_world_size():02d}"
+                        ".pth"
+                    )
+                    torch.save(
+                        consolidated_model_state_dict,
+                        os.path.join(checkpoint_path, consolidated_fn),
+                    )
+            dist.barrier()
+            del consolidated_model_state_dict
+            logger.info(f"Saved controlnet consolidated to {checkpoint_path}.")
+            
+            with FSDP.state_dict_type(
+                controlnet,
+                StateDictType.LOCAL_STATE_DICT,
+            ):
+                opt_state_fn = f"optimizer_controlnet.{dist.get_rank():05d}-of-" f"{dist.get_world_size():05d}.pth"
+                torch.save(opt.state_dict(), os.path.join(checkpoint_path, opt_state_fn))
+            dist.barrier()
+            logger.info(f"Saved controlnet optimizer to {checkpoint_path}.")
 
             if dist.get_rank() == 0:
                 torch.save(args, os.path.join(checkpoint_path, "model_args.pth"))

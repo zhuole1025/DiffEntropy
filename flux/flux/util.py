@@ -10,7 +10,7 @@ import torch
 from flux.model import Flux, FluxParams
 from flux.modules.autoencoder import AutoEncoder, AutoEncoderParams
 from flux.modules.conditioner import HFEmbedder
-
+from flux.controlnet import ControlNetFlux
 
 @dataclass
 class ModelSpec:
@@ -155,6 +155,13 @@ def load_ae(name: str, device: str | torch.device = "cuda", hf_download: bool = 
         missing, unexpected = ae.load_state_dict(sd, strict=False, assign=True)
         print_load_warning(missing, unexpected)
     return ae
+
+def load_controlnet(name: str, device: str | torch.device = "cuda", dtype=torch.float32, transformer = None):
+    with torch.device(device):
+        controlnet = ControlNetFlux(configs[name].params).to(dtype)
+    if transformer is not None:
+        controlnet.load_state_dict(transformer.state_dict(), strict=False)
+    return controlnet
 
 
 class WatermarkEmbedder:

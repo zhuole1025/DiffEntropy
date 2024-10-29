@@ -51,8 +51,8 @@ def prepare(t5: HFEmbedder, clip: HFEmbedder, img: Tensor, img_cond: Tensor, pro
         
         img_cond_ids = torch.zeros(h_cond // 2, w_cond // 2, 3)
         img_cond_ids[..., 0] = -1
-        img_cond_ids[..., 1] = img_cond_ids[..., 1] + torch.arange(h_cond // 2)[:, None] * down_factor
-        img_cond_ids[..., 2] = img_cond_ids[..., 2] + torch.arange(w_cond // 2)[None, :] * down_factor
+        img_cond_ids[..., 1] = img_cond_ids[..., 1] + (torch.arange(h_cond // 2)[:, None] * down_factor + down_factor / 2 - 0.5)
+        img_cond_ids[..., 2] = img_cond_ids[..., 2] + (torch.arange(w_cond // 2)[None, :] * down_factor + down_factor / 2 - 0.5)
         
         img_ids = repeat(img_ids, "h w c -> b (h w) c", b=bs)
         img_cond_ids = repeat(img_cond_ids, "h w c -> b (h w) c", b=bs)
@@ -84,8 +84,8 @@ def prepare(t5: HFEmbedder, clip: HFEmbedder, img: Tensor, img_cond: Tensor, pro
             
             img_cond_ids = torch.zeros(h_cond // 2, w_cond // 2, 3)
             img_cond_ids[..., 0] = -1
-            img_cond_ids[..., 1] = img_cond_ids[..., 1] + torch.arange(h_cond // 2)[:, None] * down_factor
-            img_cond_ids[..., 2] = img_cond_ids[..., 2] + torch.arange(w_cond // 2)[None, :] * down_factor
+            img_cond_ids[..., 1] = img_cond_ids[..., 1] + (torch.arange(h_cond // 2)[:, None] * down_factor + down_factor / 2 - 0.5)
+            img_cond_ids[..., 2] = img_cond_ids[..., 2] + (torch.arange(w_cond // 2)[None, :] * down_factor + down_factor / 2 - 0.5)
             
             flat_img_ids = rearrange(img_ids, "h w c -> (h w) c")
             flat_img_cond_ids = rearrange(img_cond_ids, "h w c -> (h w) c")
