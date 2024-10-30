@@ -156,9 +156,9 @@ def load_ae(name: str, device: str | torch.device = "cuda", hf_download: bool = 
         print_load_warning(missing, unexpected)
     return ae
 
-def load_controlnet(name: str, device: str | torch.device = "cuda", dtype=torch.float32, transformer = None):
+def load_controlnet(name: str, device: str | torch.device = "cuda", dtype=torch.float32, transformer = None, backbone_depth=2):
     with torch.device(device):
-        controlnet = ControlNetFlux(configs[name].params).to(dtype)
+        controlnet = ControlNetFlux(configs[name].params, backbone_depth=backbone_depth).to(dtype)
     if transformer is not None:
         controlnet.load_state_dict(transformer.state_dict(), strict=False)
     return controlnet

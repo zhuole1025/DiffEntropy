@@ -111,8 +111,13 @@ class Transport:
         if snr_type is None:
             snr_type = self.snr_type
             
-        if snr_type.startswith("uniform"):
-            assert t0 == 0.0 and t1 == 1.0, "not implemented."
+        if snr_type == "controlnet":
+            t = th.rand((len(x1),))
+            alpha = 0.3
+            t = th.where(t < alpha, 0.0, 
+                th.where(t >= 1-alpha, 1.0,
+                    th.rand_like(t)))
+        elif snr_type.startswith("uniform"):
             if "_" in snr_type:
                 _, t0, t1 = snr_type.split("_")
                 t0, t1 = float(t0), float(t1)
@@ -162,9 +167,9 @@ class Transport:
         
         if controlnet is not None:
             x1_controlnet = controlnet_kwargs.pop("controlnet_cond")
-            t_controlnet, x0_controlnet, x1_controlnet = self.sample(x1_controlnet, snr_type='uniform')
+            t_controlnet, x0_controlnet, x1_controlnet = self.sample(x1_controlnet, snr_type='controlnet')
             t_controlnet, xt_controlnet, ut_controlnet = self.path_sampler.plan(t_controlnet, x0_controlnet, x1_controlnet)
-            controls = controlnet(xt_controlnet, timesteps=1 - t_controlnet, **controlnet_kwargs)
+            controls = controlnet(xt_controlnet, timesteps=1 - t_controlnet, bb_timesteps=1 - t, **controlnet_kwargs)
             model_kwargs["controls"] = controls
             
         model_output, token_select, token_logits = model(xt, timesteps=1 - t, **model_kwargs)

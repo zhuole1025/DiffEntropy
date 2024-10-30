@@ -353,7 +353,7 @@ def main(args):
         else:
             param.requires_grad = False
     
-    controlnet = load_controlnet("flux-dev", device=device_str, dtype=torch.bfloat16, transformer=model)
+    controlnet = load_controlnet("flux-dev", device=device_str, dtype=torch.bfloat16, transformer=model, backbone_depth=args.backbone_depth)
     controlnet.train()
     controlnet_params = [p for p in controlnet.parameters() if p.requires_grad]
     
@@ -588,7 +588,7 @@ def main(args):
             num_workers=args.num_workers,
             pin_memory=True,
             collate_fn=dataloader_collate_fn,
-            prefetch_factor=3,
+            # prefetch_factor=3,
         )
 
         data_collection[train_res] = {
@@ -640,7 +640,7 @@ def main(args):
                 x = [(ae.encode(img[None].to(ae.dtype)).latent_dist.sample()[0] - ae.config.shift_factor) * ae.config.scaling_factor for img in x]
             
         with torch.no_grad():
-            inp = prepare(t5=t5, clip=clip, img=x, img_cond=x_cond, prompt=caps, proportion_empty_prompts=args.caption_dropout_prob, text_emb=text_emb)
+            inp = prepare(t5=t5, clip=clip, img=x, img_cond=x_cond, prompt=caps, proportion_empty_prompts=args.caption_dropout_prob, proportion_empty_images=args.image_dropout_prob, text_emb=text_emb)
 
         loss_item = 0.0
         opt.zero_grad()
@@ -892,6 +892,7 @@ if __name__ == "__main__":
         default=0.1,
         help="Randomly change the caption of a sample to a blank string with the given probability.",
     )
+    parser.add_argument("--image_dropout_prob", type=float, default=0.0)
     parser.add_argument("--snr_type", type=str, default="uniform")
     parser.add_argument("--do_shift", default=True)
     parser.add_argument(
@@ -924,6 +925,7 @@ if __name__ == "__main__":
         default="0.2,0.7,0.1",
         help="Comma-separated list of probabilities for sampling low resolution images."
     )
+    parser.add_argument("--backbone_depth", type=int, default=19)
     parser.add_argument("--full_model", action="store_true")
     parser.add_argument("--token_target_ratio", type=float, default=0.5)
     parser.add_argument("--token_loss_weight", type=float, default=1.0)

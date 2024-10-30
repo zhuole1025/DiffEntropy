@@ -33,7 +33,7 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=1 --nnodes=1 --master_port 29
     --ckpt_every 1000 --log_every 1 \
     --precision ${precision} --grad_precision fp32 \
     --global_seed 20240826 \
-    --num_workers 0 \
+    --num_workers 1 \
     --cache_data_on_disk \
     --snr_type ${snr_type} \
     --checkpointing \

@@ -122,10 +122,9 @@ class Flux(nn.Module):
             if (sub_token_select is not None) and (token_logits is not None):
                 token_select_list.append(sub_token_select)
                 token_logits_list.append(token_logits)
-                
             # controlnet residual
             if controls is not None:
-                img = img + [idx % len(controls)]
+                img = img + controls[idx % len(controls)]
 
         
         # pe = pe[:, :, img_cond_ids.shape[1]:, ...]
@@ -153,7 +152,7 @@ class Flux(nn.Module):
         timesteps: Tensor,
         img_ids: Tensor,
         txt: Tensor,
-        txt_ids: Tensor,controls,
+        txt_ids: Tensor,
         txt_mask: Tensor,
         y: Tensor,
         guidance: Tensor = None,

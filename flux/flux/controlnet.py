@@ -37,7 +37,7 @@ class ControlNetFlux(nn.Module):
     """
     _supports_gradient_checkpointing = True
 
-    def __init__(self, params: FluxParams, controlnet_depth=2):
+    def __init__(self, params: FluxParams, controlnet_depth=2, backbone_depth=2):
         super().__init__()
 
         self.params = params
@@ -75,7 +75,7 @@ class ControlNetFlux(nn.Module):
 
         # add ControlNet blocks
         self.controlnet_blocks = nn.ModuleList([])
-        for _ in range(controlnet_depth):
+        for _ in range(backbone_depth):
             controlnet_block = nn.Linear(self.hidden_size, self.hidden_size)
             controlnet_block = zero_module(controlnet_block)
             self.controlnet_blocks.append(controlnet_block)
@@ -106,6 +106,7 @@ class ControlNetFlux(nn.Module):
         txt: Tensor,
         txt_ids: Tensor,
         timesteps: Tensor,
+        bb_timesteps: Tensor,
         y: Tensor,
         controlnet_cond: Tensor = None,
         guidance: Tensor = None,
@@ -122,6 +123,7 @@ class ControlNetFlux(nn.Module):
             controlnet_cond = self.cond_img_in(controlnet_cond)
             img = img + controlnet_cond
         vec = self.time_in(timestep_embedding(timesteps, 256))
+        vec = vec + self.time_in(timestep_embedding(bb_timesteps, 256))
         if self.params.guidance_embed:
             if guidance is None:
                 raise ValueError("Didn't get guidance strength for guidance distilled model.")
@@ -139,7 +141,8 @@ class ControlNetFlux(nn.Module):
             block_res_samples = block_res_samples + (img,)
 
         controlnet_block_res_samples = ()
-        for block_res_sample, controlnet_block in zip(block_res_samples, self.controlnet_blocks):
+        for idx, controlnet_block in enumerate(self.controlnet_blocks):
+            block_res_sample = block_res_samples[idx % len(block_res_samples)]
             block_res_sample = controlnet_block(block_res_sample)
             controlnet_block_res_samples = controlnet_block_res_samples + (block_res_sample,)
 

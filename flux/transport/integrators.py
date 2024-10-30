@@ -103,11 +103,15 @@ class ode:
 
     def sample(self, x, model, model_kwargs, controlnet=None, controlnet_kwargs=None):
         device = x[0].device if isinstance(x, tuple) else x.device
-
+        if controlnet is not None:
+            x_cond = controlnet_kwargs.pop("controlnet_cond") 
         def _fn(t, x):
             t = th.ones(x[0].size(0)).to(device) * t if isinstance(x, tuple) else th.ones(x.size(0)).to(device) * t
             if controlnet is not None:
-                controls = controlnet(x, timesteps=1 - t, **controlnet_kwargs)
+                t_cond = th.ones(x_cond.size(0)).to(device) * 0.5
+                noise = th.randn_like(x_cond)
+                xt_cond = x_cond * t_cond.view(-1, 1, 1) + noise * (1 - t_cond).view(-1, 1, 1)
+                controls = controlnet(xt_cond, timesteps=1 - t_cond, **controlnet_kwargs)
                 model_kwargs["controls"] = controls
             model_output = self.drift(x, t, model, **model_kwargs)
             return model_output
