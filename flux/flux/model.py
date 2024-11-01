@@ -4,7 +4,7 @@ from typing import List
 import torch
 from torch import Tensor, nn
 
-from .modules.layers import DoubleStreamBlock, EmbedND, LastLayer, MLPEmbedder, SingleStreamBlock, timestep_embedding
+from .modules.layers import DoubleStreamBlock, EmbedND, LastLayer, MLPEmbedder, SingleStreamBlock, timestep_embedding, ControlNetGate
 
 
 @dataclass
@@ -77,6 +77,13 @@ class Flux(nn.Module):
 
         self.final_layer = LastLayer(self.hidden_size, 1, self.out_channels)
         
+        self.controlnet_gates = nn.ModuleList(
+            [
+                ControlNetGate(self.hidden_size)
+                for _ in range(params.depth)
+            ]   
+        )
+        
         # self.img_cond_in = nn.Linear(self.in_channels, self.hidden_size, bias=True)
         # nn.init.zeros_(self.img_cond_in.weight)
         # nn.init.zeros_(self.img_cond_in.bias)
@@ -124,8 +131,8 @@ class Flux(nn.Module):
                 token_logits_list.append(token_logits)
             # controlnet residual
             if controls is not None:
-                img = img + controls[idx % len(controls)]
-
+                gate = torch.sigmoid(self.controlnet_gates[idx](torch.cat((img, img + controls[idx % len(controls)]), dim=-1), vec))
+                img = img + controls[idx % len(controls)] * gate
         
         # pe = pe[:, :, img_cond_ids.shape[1]:, ...]
         img = torch.cat((txt, img), 1)
@@ -201,7 +208,7 @@ class Flux(nn.Module):
         return total_params
 
     def get_fsdp_wrap_module_list(self) -> List[nn.Module]:
-        return list(self.double_blocks) + list(self.single_blocks) + [self.final_layer]
+        return list(self.double_blocks) + list(self.single_blocks) + [self.final_layer] + list(self.controlnet_gates)
 
     def get_checkpointing_wrap_module_list(self) -> List[nn.Module]:
-        return list(self.double_blocks) + list(self.single_blocks) + [self.final_layer]
+        return list(self.double_blocks) + list(self.single_blocks) + [self.final_layer] + list(self.controlnet_gates)

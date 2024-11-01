@@ -521,3 +521,24 @@ class LastLayer(nn.Module):
         x = (1 + scale[:, None, :]) * self.norm_final(x) + shift[:, None, :]
         x = self.linear(x)
         return x
+
+
+class ControlNetGate(nn.Module):
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.linear_x = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size // 2)
+        )
+        self.linear_y = nn.Linear(hidden_size, hidden_size // 2)
+        self.linear_out = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.SiLU(),
+            nn.Linear(hidden_size // 2, 1)
+        )
+        
+    def forward(self, x: Tensor, y: Tensor) -> Tensor:
+        x = self.linear_x(x)
+        y = self.linear_y(y)
+        return self.linear_out(torch.cat((x, y.unsqueeze(1).expand(-1, x.shape[1], -1)), dim=-1))

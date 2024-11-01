@@ -2,4 +2,4 @@ META:
   -
     path: '/data/DiffEntropy/krea_2M_full_filtered.json'
     type: 'image_text'
-    root: '/goosedata/images'
+    root: '/data/images'

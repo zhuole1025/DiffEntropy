@@ -21,7 +21,7 @@ mkdir -p results/"$exp_name"
 # unset NCCL_IB_HCA
 #export TOKENIZERS_PARALLELISM=false
 
-CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=1 --nnodes=1 --master_port 29338 train_controlnet.py \
+CUDA_VISIBLE_DEVICES=7 torchrun --nproc_per_node=1 --nnodes=1 --master_port 29338 train_controlnet.py \
     --master_port 18181 \
     --global_bs ${batch_size} \
     --micro_bs ${micro_batch_size} \

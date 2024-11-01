@@ -342,24 +342,27 @@ def main(args):
     # for block in model.double_blocks:
         # block.init_cond_weights()
     model_params = []
+    controlnet_params = []
     for name, param in model.named_parameters():
         if args.full_model:
             param.requires_grad = True
             model_params.append(param)
-        # elif "cond" in name or 'norm' in name or 'bias' in name:
-        # elif 'double_blocks' in name:
-            # param.requires_grad = True
-            # model_params.append(param)
+        elif 'norm' in name or 'bias' in name:
+            param.requires_grad = True
+            model_params.append(param)
+        elif 'controlnet_gates' in name:
+            param.requires_grad = True
+            controlnet_params.append(param)
         else:
             param.requires_grad = False
     
     controlnet = load_controlnet("flux-dev", device=device_str, dtype=torch.bfloat16, transformer=model, backbone_depth=args.backbone_depth)
     controlnet.train()
-    controlnet_params = [p for p in controlnet.parameters() if p.requires_grad]
+    controlnet_params = controlnet_params + [p for p in controlnet.parameters() if p.requires_grad]
     
     total_params = model.parameter_count()
     size_in_gb = total_params * 4 / 1e9
-    logger.info(f"Model Size: {size_in_gb:.2f} GB, Total Parameters: {total_params / 1e9:.2f} B, Trainable Parameters: {sum(p.numel() for p in model_params) / 1e9:.2f} B, ControlNet Trainable Parameters: {sum(p.numel() for p in controlnet_params) / 1e9:.2f} B")
+    logger.info(f"Model Size: {size_in_gb:.2f} GB, Total Parameters: {total_params / 1e9:.2f} B, Trainable Parameters: {sum(p.numel() for p in model_params) / 1e9:.3f} B, ControlNet Trainable Parameters: {sum(p.numel() for p in controlnet_params) / 1e9:.3f} B")
 
     if args.auto_resume and args.resume is None:
         try:
@@ -493,10 +496,18 @@ def main(args):
 
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant
     # learning rate of 1e-4 in our paper):
-    if len(model_params) + len(controlnet_params) > 0:
-        opt = torch.optim.AdamW(model_params + controlnet_params, lr=args.lr, weight_decay=args.wd)
+    if len(model_params) > 0 and len(controlnet_params) > 0:
+        opt = torch.optim.AdamW([
+            {'params': model_params, 'lr': args.lr * 0.1},
+            {'params': controlnet_params, 'lr': args.lr}
+        ], weight_decay=args.wd)
+    elif len(model_params) > 0:
+        opt = torch.optim.AdamW(model_params, lr=args.lr, weight_decay=args.wd)
+    elif len(controlnet_params) > 0:
+        opt = torch.optim.AdamW(controlnet_params, lr=args.lr, weight_decay=args.wd)
     else:
-        opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
+        raise ValueError("No trainable parameters found in either model or controlnet")
+
     if args.resume:
         opt_state_world_size = len(
             [x for x in os.listdir(args.resume) if x.startswith("optimizer.") and x.endswith(".pth")]

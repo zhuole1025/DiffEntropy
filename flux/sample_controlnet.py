@@ -55,7 +55,7 @@ def main(args, rank, master_port):
     print("Init controlnet")
     params = configs[args.model].params
     with torch.device(device_str):
-        controlnet = ControlNetFlux(params).to(dtype)
+        controlnet = ControlNetFlux(params, backbone_depth=train_args.backbone_depth).to(dtype)
     controlnet.eval()
     
     print("Init model")

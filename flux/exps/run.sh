@@ -15,13 +15,13 @@ high_res_list=1024
 high_res_probs=1.0
 snr_type=lognorm
 
-exp_name=${high_res_list}_${high_res_probs}_${low_res_list}_${low_res_probs}_controlnet_noisy_v2
+exp_name=${high_res_list}_${high_res_probs}_${low_res_list}_${low_res_probs}_controlnet_noisy_gate_bias_norm
 mkdir -p results/"$exp_name"
 
 # unset NCCL_IB_HCA
 #export TOKENIZERS_PARALLELISM=false
 
-torchrun --nproc_per_node=8 --nnodes=1 --master_port 29348 train_controlnet.py \
+CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 --nnodes=1 --master_port 29311 train_controlnet.py \
     --master_port 18181 \
     --global_bs ${batch_size} \
     --micro_bs ${micro_batch_size} \
