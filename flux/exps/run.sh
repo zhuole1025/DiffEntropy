@@ -7,21 +7,23 @@ export HF_HOME="/data/huggingface"
 train_data_root='configs/data/2M.yaml'
 batch_size=8
 micro_batch_size=1
-lr=1e-4
+lr=1e-5
 precision=bf16
 low_res_list=256
 low_res_probs=1.0
 high_res_list=1024
 high_res_probs=1.0
 snr_type=lognorm
+controlnet_depth=6
+backbone_depth=19
 
-exp_name=${high_res_list}_${high_res_probs}_${low_res_list}_${low_res_probs}_controlnet_noisy_gate_bias_norm
+exp_name=${high_res_list}_${high_res_probs}_${low_res_list}_${low_res_probs}_controlnet_${controlnet_depth}_backbone_${backbone_depth}
 mkdir -p results/"$exp_name"
 
 # unset NCCL_IB_HCA
 #export TOKENIZERS_PARALLELISM=false
 
-CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 --nnodes=1 --master_port 29311 train_controlnet.py \
+torchrun --nproc_per_node=8 --nnodes=1 --master_port 29311 train_controlnet.py \
     --master_port 18181 \
     --global_bs ${batch_size} \
     --micro_bs ${micro_batch_size} \
@@ -30,10 +32,10 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 --nnodes=1 --master_por
     --lr ${lr} --grad_clip 2.0 \
     --data_parallel fsdp \
     --max_steps 1000000 \
-    --ckpt_every 2000 --log_every 10 \
+    --ckpt_every 4000 --log_every 10 \
     --precision ${precision} --grad_precision fp32 \
     --global_seed 20240826 \
-    --num_workers 16 \
+    --num_workers 8 \
     --cache_data_on_disk \
     --snr_type ${snr_type} \
     --high_res_list ${high_res_list} \
@@ -41,5 +43,7 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 --nnodes=1 --master_por
     --low_res_list ${low_res_list} \
     --low_res_probs ${low_res_probs} \
     --use_wandb \
+    --controlnet_depth ${controlnet_depth} \
+    --backbone_depth ${backbone_depth} \
     # --checkpointing \
     

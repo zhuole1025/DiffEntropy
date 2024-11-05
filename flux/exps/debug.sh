@@ -14,8 +14,10 @@ low_res_probs=1.0
 high_res_list=1024
 high_res_probs=1.0
 snr_type=lognorm
+controlnet_depth=6
+backbone_depth=19
 
-exp_name=${high_res_list}_${high_res_probs}
+exp_name=test
 mkdir -p results/"$exp_name"
 
 # unset NCCL_IB_HCA
@@ -41,6 +43,8 @@ CUDA_VISIBLE_DEVICES=7 torchrun --nproc_per_node=1 --nnodes=1 --master_port 2933
     --high_res_probs ${high_res_probs} \
     --low_res_list ${low_res_list} \
     --low_res_probs ${low_res_probs} \
+    --controlnet_depth ${controlnet_depth} \
+    --backbone_depth ${backbone_depth} \
     --debug \
     # --zero_init \
     # --use_wandb

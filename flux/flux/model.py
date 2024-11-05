@@ -77,12 +77,12 @@ class Flux(nn.Module):
 
         self.final_layer = LastLayer(self.hidden_size, 1, self.out_channels)
         
-        self.controlnet_gates = nn.ModuleList(
-            [
-                ControlNetGate(self.hidden_size)
-                for _ in range(params.depth)
-            ]   
-        )
+        # self.controlnet_gates = nn.ModuleList(
+        #     [
+        #         ControlNetGate(self.hidden_size)
+        #         for _ in range(params.depth)
+        #     ]   
+        # )
         
         # self.img_cond_in = nn.Linear(self.in_channels, self.hidden_size, bias=True)
         # nn.init.zeros_(self.img_cond_in.weight)
@@ -124,6 +124,7 @@ class Flux(nn.Module):
         
         token_select_list = []
         token_logits_list = []
+        gate_logits_list = []
         for idx, block in enumerate(self.double_blocks):
             img, txt, img_cond, sub_token_select, token_logits = block(img=img, txt=txt, vec=vec, pe=pe, img_mask=img_mask, txt_mask=txt_mask, cond=img_cond, cond_mask=img_cond_mask)
             if (sub_token_select is not None) and (token_logits is not None):
@@ -131,8 +132,10 @@ class Flux(nn.Module):
                 token_logits_list.append(token_logits)
             # controlnet residual
             if controls is not None:
-                gate = torch.sigmoid(self.controlnet_gates[idx](torch.cat((img, img + controls[idx % len(controls)]), dim=-1), vec))
-                img = img + controls[idx % len(controls)] * gate
+                # gate = torch.tanh(self.controlnet_gates[idx](torch.cat((img, img + controls[idx % len(controls)]), dim=-1), vec))
+                # print(timesteps[0].item(), idx, gate.abs().mean().item(), gate.abs().var().item(), (controls[idx % len(controls)] * gate).mean().item(), img.mean().item())
+                img = img + controls[idx % len(controls)] * 0.5
+                # gate_logits_list.append(gate)
         
         # pe = pe[:, :, img_cond_ids.shape[1]:, ...]
         img = torch.cat((txt, img), 1)
@@ -147,11 +150,17 @@ class Flux(nn.Module):
             # img = img[:, img_cond.shape[1] :, ...]
         img = img[:, txt.shape[1] :, ...]
         
-        token_select = torch.stack(token_select_list, dim=1) if len(token_select_list) > 0 else None
-        token_logits = torch.stack(token_logits_list, dim=1) if len(token_logits_list) > 0 else None
+        # gate_logits = torch.stack(gate_logits_list, dim=1) if len(gate_logits_list) > 0 else None
+        # token_select = torch.stack(token_select_list, dim=1) if len(token_select_list) > 0 else None
+        # token_logits = torch.stack(token_logits_list, dim=1) if len(token_logits_list) > 0 else None
 
         img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
-        return img, token_select, token_logits
+        return {
+            "output": img,
+            # "gate_logits": gate_logits,
+            # "token_select": token_select,
+            # "token_logits": token_logits
+        }
 
     def forward_with_cfg(
         self,
@@ -173,7 +182,7 @@ class Flux(nn.Module):
     ) -> Tensor:
         half = img[: len(img) // 3]
         combined = torch.cat([half, half, half], dim=0)
-        model_out, _, _ = self.forward(
+        model_out = self.forward(
             img=combined, 
             timesteps=timesteps, 
             img_ids=img_ids, 
@@ -187,7 +196,7 @@ class Flux(nn.Module):
             img_mask=img_mask, 
             img_cond_mask=img_cond_mask, 
             controls=controls
-        )
+        )["output"]
 
         cond_v, txt_cond_v, uncond_v = torch.split(model_out, len(model_out) // 3, dim=0)
         cond_v = txt_cond_v + txt_cfg_scale * (cond_v - txt_cond_v)
@@ -208,7 +217,7 @@ class Flux(nn.Module):
         return total_params
 
     def get_fsdp_wrap_module_list(self) -> List[nn.Module]:
-        return list(self.double_blocks) + list(self.single_blocks) + [self.final_layer] + list(self.controlnet_gates)
+        return list(self.double_blocks) + list(self.single_blocks) + [self.final_layer]
 
     def get_checkpointing_wrap_module_list(self) -> List[nn.Module]:
-        return list(self.double_blocks) + list(self.single_blocks) + [self.final_layer] + list(self.controlnet_gates)
+        return list(self.double_blocks) + list(self.single_blocks) + [self.final_layer]

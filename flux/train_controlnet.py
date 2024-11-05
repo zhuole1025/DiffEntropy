@@ -347,16 +347,16 @@ def main(args):
         if args.full_model:
             param.requires_grad = True
             model_params.append(param)
-        elif 'norm' in name or 'bias' in name:
-            param.requires_grad = True
-            model_params.append(param)
+        # elif 'norm' in name or 'bias' in name:
+            # param.requires_grad = True
+            # model_params.append(param)
         elif 'controlnet_gates' in name:
             param.requires_grad = True
             controlnet_params.append(param)
         else:
             param.requires_grad = False
     
-    controlnet = load_controlnet("flux-dev", device=device_str, dtype=torch.bfloat16, transformer=model, backbone_depth=args.backbone_depth)
+    controlnet = load_controlnet("flux-dev", device=device_str, dtype=torch.bfloat16, transformer=model, controlnet_depth=args.controlnet_depth, backbone_depth=args.backbone_depth)
     controlnet.train()
     controlnet_params = controlnet_params + [p for p in controlnet.parameters() if p.requires_grad]
     
@@ -936,6 +936,7 @@ if __name__ == "__main__":
         default="0.2,0.7,0.1",
         help="Comma-separated list of probabilities for sampling low resolution images."
     )
+    parser.add_argument("--controlnet_depth", type=int, default=2)
     parser.add_argument("--backbone_depth", type=int, default=19)
     parser.add_argument("--full_model", action="store_true")
     parser.add_argument("--token_target_ratio", type=float, default=0.5)

@@ -55,7 +55,7 @@ def main(args, rank, master_port):
     print("Init controlnet")
     params = configs[args.model].params
     with torch.device(device_str):
-        controlnet = ControlNetFlux(params, backbone_depth=train_args.backbone_depth).to(dtype)
+        controlnet = ControlNetFlux(params, controlnet_depth=train_args.controlnet_depth, backbone_depth=train_args.backbone_depth).to(dtype)
     controlnet.eval()
     
     print("Init model")
@@ -212,7 +212,7 @@ def main(args, rank, master_port):
                         y=inp["vec"],
                         txt_mask=inp["txt_mask"],
                         img_mask=inp["img_mask"],
-                        guidance=torch.full((x.shape[0],), 4.0, device=x.device, dtype=x.dtype),
+                        guidance=torch.full((x.shape[0],), 0.0, device=x.device, dtype=x.dtype),
                     )
 
                     samples = sample_fn(

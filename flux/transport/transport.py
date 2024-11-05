@@ -172,8 +172,8 @@ class Transport:
             controls = controlnet(xt_controlnet, timesteps=1 - t_controlnet, bb_timesteps=1 - t, **controlnet_kwargs)
             model_kwargs["controls"] = controls
             
-        model_output, token_select, token_logits = model(xt, timesteps=1 - t, **model_kwargs)
-        model_output = -model_output  # todo check if this is all needed
+        out_dict = model(xt, timesteps=1 - t, **model_kwargs)
+        model_output = -out_dict["output"]  # todo check if this is all needed
         
         terms = {}
         if self.model_type == ModelType.VELOCITY:
@@ -200,7 +200,19 @@ class Transport:
         terms["loss"] = terms["task_loss"]
         terms["task_loss"] = terms["task_loss"].clone().detach()
         
-        if token_select is not None:
+        if "gate_logits" in out_dict:
+            gate_logits = out_dict["gate_logits"]
+            if "img_mask" in model_kwargs:
+                B, N, L, _ = gate_logits.shape
+                img_mask = model_kwargs["img_mask"]
+                token_loss = (gate_logits - t_controlnet) * img_mask.unsqueeze(-1)
+                token_loss = (token_loss ** 2).sum(dim=list(range(1, gate_logits.dim()))) / (img_mask.sum(dim=1) * N)
+            else:
+                token_loss = mean_flat((gate_logits - t_controlnet) ** 2)
+            terms["loss"] += token_loss
+            terms["gate_loss"] = token_loss.clone().detach()
+        
+        if "token_select" in out_dict:
             if "img_mask" in model_kwargs:
                 B, N, L, _ = token_select.shape
                 img_mask = model_kwargs["img_mask"]
