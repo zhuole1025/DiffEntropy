@@ -129,13 +129,14 @@ def main(args, rank, master_port):
                                 
                 if int(args.seed) != 0:
                     torch.random.manual_seed(int(args.seed))
-                    
-                res_cat, resolution = high_res.split(":")
-                res_cat = int(res_cat)
 
-                sample_id = f'{idx}_{resolution}'
+                sample_id = f'{idx}_{high_res}'
                 if sample_id in collected_id:
                     continue
+
+                res_cat, resolution = high_res.split(":")
+                res_cat = int(res_cat)
+                do_extrapolation = res_cat > 1024
 
                 n = len(caps_list)
                 h, w = resolution.split("x")
@@ -153,7 +154,7 @@ def main(args, rank, master_port):
                     y=inp["vec"], 
                     img_ids=inp["img_ids"], 
                     img_mask=inp["img_mask"], 
-                    guidance=torch.full((x.shape[0],), 0, device=x.device, dtype=x.dtype), 
+                    guidance=torch.full((x.shape[0],), 1.0, device=x.device, dtype=x.dtype), 
                     txt_cfg_scale=args.txt_cfg_scale, 
                 )
 

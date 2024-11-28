@@ -522,7 +522,6 @@ def main(args):
         None,
         None,
         snr_type=args.snr_type,
-        loss_type=args.loss_type,
         do_shift=args.do_shift,
         token_target_ratio=args.token_target_ratio,
         token_loss_weight=args.token_loss_weight,
@@ -643,7 +642,7 @@ def main(args):
                 txt_mask=inp["txt_mask"][mb_st:mb_ed],
                 y=inp["vec"][mb_st:mb_ed],
                 img_mask=inp["img_mask"][mb_st:mb_ed],
-                guidance=torch.full((x_mb.shape[0],), 0.0, device=x_mb.device, dtype=x_mb.dtype),
+                guidance=torch.full((x_mb.shape[0],), 1.0, device=x_mb.device, dtype=x_mb.dtype),
             )
             
             extra_kwargs = dict(
@@ -654,7 +653,7 @@ def main(args):
                 y=vec_uncond[mb_st:mb_ed],
                 img_mask=inp["img_mask"][mb_st:mb_ed],
                 drop_mask=inp["drop_mask"][mb_st:mb_ed],
-                guidance=torch.full((x_mb.shape[0],), 0.0, device=x_mb.device, dtype=x_mb.dtype),
+                guidance=torch.full((x_mb.shape[0],), 1.0, device=x_mb.device, dtype=x_mb.dtype),
             )
             
             with {
@@ -843,7 +842,6 @@ if __name__ == "__main__":
         default=0.1,
         help="Randomly change the caption of a sample to a blank string with the given probability.",
     )
-    parser.add_argument("--loss_type", type=str, default="mse")
     parser.add_argument("--snr_type", type=str, default="uniform")
     parser.add_argument("--do_shift", default=True)
     parser.add_argument(

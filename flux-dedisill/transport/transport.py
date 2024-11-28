@@ -41,20 +41,20 @@ class WeightType(enum.Enum):
 
 
 class Transport:
-    def __init__(self, *, model_type, path_type, train_eps, sample_eps, snr_type, loss_type, do_shift, token_target_ratio, token_loss_weight):
+    def __init__(self, *, model_type, path_type, loss_type, train_eps, sample_eps, snr_type, do_shift, token_target_ratio, token_loss_weight):
         path_options = {
             PathType.LINEAR: path.ICPlan,
             PathType.GVP: path.GVPCPlan,
             PathType.VP: path.VPCPlan,
         }
 
+        self.loss_type = loss_type
         self.model_type = model_type
         self.path_sampler = path_options[path_type]()
         self.train_eps = train_eps
         self.sample_eps = sample_eps
 
         self.snr_type = snr_type
-        self.loss_type = loss_type
         self.do_shift = do_shift
         self.token_target_ratio = token_target_ratio
         self.token_loss_weight = token_loss_weight
@@ -149,7 +149,7 @@ class Transport:
         t, x0, x1 = self.sample(x1)
         t, xt, ut = self.path_sampler.plan(t, x0, x1)
         B = len(x0)
-        x_bk = xt.clone()
+
         if controlnet is not None:
             x1_controlnet = controlnet_kwargs.pop("controlnet_cond")
             t_controlnet, x0_controlnet, x1_controlnet = self.sample(x1_controlnet, snr_type='controlnet')
@@ -183,9 +183,10 @@ class Transport:
         terms["loss"] = terms["task_loss"]
         terms["task_loss"] = terms["task_loss"].clone().detach()
 
+        
         if extra_kwargs is not None:
             drop_mask = extra_kwargs.pop("drop_mask")
-            # cfg_scale = (th.rand((len(x1), ), device=x1.device, dtype=x1.dtype) * 8 + 2)
+            # cfg_scale = th.rand((len(x1), ), device=x1.device, dtype=x1.dtype) * 5
             cfg_scale = th.randn((len(x1),), device=x1.device, dtype=x1.dtype) * 1.5 + 4.0  # mean=4, std=1.5
             cfg_scale = th.clamp(cfg_scale, 1.0, 10.0)
             with th.no_grad():
@@ -193,21 +194,24 @@ class Transport:
                 ref_out_dict = model_ref(xt, timesteps=1 - t, **model_kwargs)
                 ref_output = -ref_out_dict["output"]
 
-                uncond_out_dict = model(xt, timesteps=1 - t, **extra_kwargs)
-                uncond_output = -uncond_out_dict["output"]
+            uncond_out_dict = model(xt, timesteps=1 - t, **extra_kwargs)
+            uncond_output = -uncond_out_dict["output"]
             
             B, L, D = model_output.shape
             img_mask = model_kwargs["img_mask"]
-            cfg_output = model_output + cfg_scale * (model_output - uncond_output) # （1 + a) * student - b * lora
-            if self.loss_type == "huber":
-                mask_loss = (th.sqrt((cfg_output.float() - ref_output.float()) ** 2 + 0.001 ** 2) - 0.001) * img_mask.unsqueeze(-1)
-                terms["cfg_loss"] = mask_loss.sum(dim=list(range(1, ref_output.dim()))) / (img_mask.sum(dim=1) * D) * drop_mask
-            else:
-                mask_loss = (cfg_output - ref_output) * img_mask.unsqueeze(-1)  # [B, L, D]
-                terms["cfg_loss"] = (mask_loss ** 2).sum(dim=list(range(1, ref_output.dim()))) / (img_mask.sum(dim=1) * D) * drop_mask
+            cfg_output = uncond_output + cfg_scale * (model_output.detach() - uncond_output) # （1 + a) * student - b * lora
+            # cfg_output = model_output + cfg_scale * (model_output - uncond_output) # （1 + a) * student - b * lora
+            mask_loss = (th.sqrt((cfg_output.float() - ref_output.float()) ** 2 + 0.001 ** 2) - 0.001) * img_mask.unsqueeze(-1)
+            terms["cfg_loss"] = mask_loss.sum(dim=list(range(1, ref_output.dim()))) / (img_mask.sum(dim=1) * D) * drop_mask
+            # mask_loss = (cfg_output - ref_output) * img_mask.unsqueeze(-1)  # [B, L, D]
+            # terms["cfg_loss"] = (mask_loss ** 2).sum(dim=list(range(1, ref_output.dim()))) / (img_mask.sum(dim=1) * D) * drop_mask
+
+
             terms["loss"] += terms["cfg_loss"]
             terms["cfg_loss"] = terms["cfg_loss"].clone().detach()
-        
+        # terms["cfg_loss"] = terms["task_loss"].clone().detach()
+        # terms["task_loss"] = terms["cfg_loss"].clone().detach()
+
         if "gate_logits" in out_dict:
             gate_logits = out_dict["gate_logits"]
             if "img_mask" in model_kwargs:
@@ -231,26 +235,6 @@ class Transport:
             terms["loss"] += token_loss * self.token_loss_weight
             terms["token_loss"] = token_loss.clone().detach()
         
-        return terms
-    
-    def get_velocity(self, model, x1, model_kwargs=None):
-
-        if model_kwargs == None:
-            model_kwargs = {}
-        if "xt" in model_kwargs:
-            t = model_kwargs.pop("timesteps")
-            xt = model_kwargs.pop("xt")
-        else:   
-            raise NotImplementedError("xt is not in model_kwargs")
-            # t, x0, x1 = self.sample(x1)
-            # t, xt, ut = self.path_sampler.plan(t, x0, x1)
-        
-        B = len(xt)
-        out_dict = model(xt, timesteps=1 - t, **model_kwargs)
-        model_output = -out_dict["output"]  # todo check if this is all needed
-
-        terms = {"velocity": model_output, "timesteps": t}
-
         return terms
 
     def get_drift(self):
