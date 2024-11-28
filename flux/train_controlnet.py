@@ -655,6 +655,15 @@ def main(args):
 
         loss_item = 0.0
         opt.zero_grad()
+        
+        # Number of bins, for loss recording
+        n_loss_bins = 20
+        # Create bins for t
+        loss_bins = torch.linspace(0.0, 1.0, n_loss_bins + 1, device="cuda")
+        # Initialize occurrence and sum tensors
+        bin_occurrence = torch.zeros(n_loss_bins, device="cuda")
+        bin_sum_loss = torch.zeros(n_loss_bins, device="cuda")
+            
         for mb_idx in range((data_pack["local_bsz"] - 1) // data_pack["micro_bsz"] + 1):
             mb_st = mb_idx * data_pack["micro_bsz"]
             mb_ed = min((mb_idx + 1) * data_pack["micro_bsz"], data_pack["local_bsz"])
@@ -670,7 +679,7 @@ def main(args):
                 y=inp["vec"][mb_st:mb_ed],
                 img_mask=inp["img_mask"][mb_st:mb_ed],
                 img_cond_mask=inp["img_cond_mask"][mb_st:mb_ed],
-                guidance=torch.full((x_mb.shape[0],), 4.0, device=x_mb.device, dtype=x_mb.dtype),
+                guidance=torch.full((x_mb.shape[0],), 1.0, device=x_mb.device, dtype=x_mb.dtype),
             )
             
             controlnet_kwargs = dict(
@@ -681,7 +690,7 @@ def main(args):
                 y=inp["vec"][mb_st:mb_ed],
                 txt_mask=inp["txt_mask"][mb_st:mb_ed],
                 img_mask=inp["img_mask"][mb_st:mb_ed],
-                guidance=torch.full((x_mb.shape[0],), 4.0, device=x_mb.device, dtype=x_mb.dtype),
+                guidance=torch.full((x_mb.shape[0],), 1.0, device=x_mb.device, dtype=x_mb.dtype),
             )
             
             with {
@@ -695,6 +704,17 @@ def main(args):
             loss_item += loss.item()
             with model.no_sync() if args.data_parallel in ["sdp"] and not last_mb else contextlib.nullcontext():
                 loss.backward()
+                
+            # for bin-wise loss recording
+            # Digitize t values to find which bin they belong to
+            bin_indices = torch.bucketize(loss_dict["t"].cuda(), loss_bins, right=True) - 1
+            detached_loss = loss_dict["loss"].detach()
+            
+            # Iterate through each bin index to update occurrence and sum
+            for i in range(n_loss_bins):
+                mask = bin_indices == i  # Mask for elements in the i-th bin
+                bin_occurrence[i] = bin_occurrence[i] + mask.sum()  # Count occurrences in the i-th bin
+                bin_sum_loss[i] = bin_sum_loss[i] + detached_loss[mask].sum()  # Sum loss values in the i-th bin
         
         if len(model_params) > 0:
             grad_norm = model.clip_grad_norm_(max_norm=args.grad_clip)
@@ -704,6 +724,9 @@ def main(args):
             controlnet_grad_norm = controlnet.clip_grad_norm_(max_norm=args.grad_clip)
         else:
             controlnet_grad_norm = 0.0
+            
+        dist.all_reduce(bin_occurrence)
+        dist.all_reduce(bin_sum_loss)
 
         if tb_logger is not None:
             tb_logger.add_scalar(f"train/loss", loss_item, step)
@@ -712,12 +735,17 @@ def main(args):
             tb_logger.add_scalar(f"train/lr", opt.param_groups[0]["lr"], step)
                 
         if args.use_wandb and rank == 0:
-            wandb.log({
+            log_dict = {
                 "train/loss": loss_item,
                 "train/grad_norm": grad_norm,
                 "train/controlnet_grad_norm": controlnet_grad_norm,
                 "train/lr": opt.param_groups[0]["lr"],
-            }, step=step)
+            }
+            for i in range(n_loss_bins):
+                if bin_occurrence[i] > 0:
+                    bin_avg_loss = (bin_sum_loss[i] / bin_occurrence[i]).item()
+                    log_dict[f"train/loss-bin{i+1}-{n_loss_bins}"] = bin_avg_loss
+            wandb.log(log_dict, step=step)
 
         opt.step()
         end_time = time()
@@ -729,13 +757,17 @@ def main(args):
         metrics["controlnet_grad_norm"].update(controlnet_grad_norm)
         metrics["Secs/Step"].update(end_time - start_time)
         metrics["Imgs/Sec"].update(data_pack["global_bsz"] / (end_time - start_time))
+        for i in range(n_loss_bins):
+            if bin_occurrence[i] > 0:
+                bin_avg_loss = (bin_sum_loss[i] / bin_occurrence[i]).item()
+                metrics[f"bin{i + 1:02}-{n_loss_bins}"].update(bin_avg_loss, int(bin_occurrence[i].item()))
         if (step + 1) % args.log_every == 0:
             # Measure training speed:
             torch.cuda.synchronize()
             logger.info(
-                f"Res{high_res}: (step{step + 1:07d}) "
+                f"Res{train_res}: (step{step + 1:07d}) "
                 + f"lr{opt.param_groups[0]['lr']:.6f} "
-                + " ".join([f"{key}:{str(val)}" for key, val in metrics.items()])
+                + " ".join([f"{key}:{str(metrics[key])}" for key in sorted(metrics.keys())])
             )
 
         start_time = time()
@@ -905,7 +937,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--image_dropout_prob", type=float, default=0.0)
     parser.add_argument("--snr_type", type=str, default="uniform")
-    parser.add_argument("--do_shift", default=True)
+    parser.add_argument("--do_shift", default=False)
     parser.add_argument(
         "--no_shift",
         action="store_false",

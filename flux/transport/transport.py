@@ -7,7 +7,7 @@ import torch as th
 
 from . import path
 from .integrators import ode, sde
-from .utils import mean_flat
+from .utils import mean_flat, time_shift, get_lin_function
 
 
 class ModelType(enum.Enum):
@@ -123,7 +123,7 @@ class Transport:
                 t0, t1 = float(t0), float(t1)
             t = th.rand((len(x1),)) * (t1 - t0) + t0
         elif snr_type == "lognorm":
-            u = th.normal(mean=0.0, std=1.0, size=(len(x1),))
+            u = th.normal(mean=0.5, std=1.0, size=(len(x1),))
             t = 1 / (1 + th.exp(-u)) * (t1 - t0) + t0
         else:
             raise NotImplementedError("Not implemented snr_type %s" % snr_type)
@@ -131,8 +131,8 @@ class Transport:
         if self.do_shift:
             base_shift: float = 0.5
             max_shift: float = 1.15
-            mu = self.get_lin_function(y1=base_shift, y2=max_shift)(x1.shape[1])
-            t = self.time_shift(mu, 1.0, t)
+            mu = get_lin_function(y1=base_shift, y2=max_shift)(x1.shape[1])
+            t = time_shift(mu, 1.0, t)
 
         t = t.to(x1[0])
         return t, x0, x1
@@ -167,7 +167,7 @@ class Transport:
         
         if controlnet is not None:
             x1_controlnet = controlnet_kwargs.pop("controlnet_cond")
-            t_controlnet, x0_controlnet, x1_controlnet = self.sample(x1_controlnet, snr_type='controlnet')
+            t_controlnet, x0_controlnet, x1_controlnet = self.sample(x1_controlnet, snr_type='uniform')
             t_controlnet, xt_controlnet, ut_controlnet = self.path_sampler.plan(t_controlnet, x0_controlnet, x1_controlnet)
             controls = controlnet(xt_controlnet, timesteps=1 - t_controlnet, bb_timesteps=1 - t, **controlnet_kwargs)
             model_kwargs["controls"] = controls
@@ -223,6 +223,7 @@ class Transport:
             terms["loss"] += token_loss * self.token_loss_weight
             terms["token_loss"] = token_loss.clone().detach()
         
+        terms["t"] = t
         return terms
 
     def get_drift(self):
@@ -413,6 +414,7 @@ class Sampler:
         atol=1e-6,
         rtol=1e-3,
         reverse=False,
+        do_shift=True,
         time_shifting_factor=None,
     ):
         """returns a sampling function with given ODE settings
@@ -445,6 +447,7 @@ class Sampler:
             num_steps=num_steps,
             atol=atol,
             rtol=rtol,
+            do_shift=do_shift,
             time_shifting_factor=time_shifting_factor,
         )
 

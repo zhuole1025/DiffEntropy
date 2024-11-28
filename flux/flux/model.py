@@ -134,7 +134,7 @@ class Flux(nn.Module):
             if controls is not None:
                 # gate = torch.tanh(self.controlnet_gates[idx](torch.cat((img, img + controls[idx % len(controls)]), dim=-1), vec))
                 # print(timesteps[0].item(), idx, gate.abs().mean().item(), gate.abs().var().item(), (controls[idx % len(controls)] * gate).mean().item(), img.mean().item())
-                img = img + controls[idx % len(controls)] * 0.5
+                img = img + controls[idx % len(controls)]
                 # gate_logits_list.append(gate)
         
         # pe = pe[:, :, img_cond_ids.shape[1]:, ...]

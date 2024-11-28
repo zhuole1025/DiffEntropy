@@ -1,6 +1,6 @@
 import torch as th
 from torchdiffeq import odeint
-
+from .utils import time_shift, get_lin_function
 
 class sde:
     """SDE solver class"""
@@ -89,11 +89,13 @@ class ode:
         num_steps,
         atol,
         rtol,
+        do_shift=True,
         time_shifting_factor=None,
     ):
         assert t0 < t1, "ODE sampler has to be in forward time"
 
         self.drift = drift
+        self.do_shift = do_shift
         self.t = th.linspace(t0, t1, num_steps)
         if time_shifting_factor:
             self.t = self.t / (self.t + time_shifting_factor - time_shifting_factor * self.t)
@@ -108,7 +110,7 @@ class ode:
         def _fn(t, x):
             t = th.ones(x[0].size(0)).to(device) * t if isinstance(x, tuple) else th.ones(x.size(0)).to(device) * t
             if controlnet is not None:
-                t_cond = th.ones(x_cond.size(0)).to(device) * 1.0
+                t_cond = th.ones(x_cond.size(0)).to(device) * 0.5
                 noise = th.randn_like(x_cond)
                 xt_cond = x_cond * t_cond.view(-1, 1, 1) + noise * (1 - t_cond).view(-1, 1, 1)
                 controls = controlnet(xt_cond, timesteps=1 - t_cond, bb_timesteps=1 - t, **controlnet_kwargs)
@@ -117,6 +119,9 @@ class ode:
             return model_output
 
         t = self.t.to(device)
+        if self.do_shift:
+            mu = get_lin_function(y1=0.5, y2=1.15)(x.shape[1])
+            t = time_shift(mu, 1.0, t)
         atol = [self.atol] * len(x) if isinstance(x, tuple) else [self.atol]
         rtol = [self.rtol] * len(x) if isinstance(x, tuple) else [self.rtol]
         samples = odeint(_fn, x, t, method=self.sampler_type, atol=atol, rtol=rtol)

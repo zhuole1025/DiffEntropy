@@ -9,15 +9,15 @@ batch_size=8
 micro_batch_size=1
 lr=1e-5
 precision=bf16
-low_res_list=256
-low_res_probs=1.0
+low_res_list=256,128,64
+low_res_probs=0.4,0.4,0.2
 high_res_list=1024
 high_res_probs=1.0
 snr_type=lognorm
-controlnet_depth=6
+controlnet_depth=2
 backbone_depth=19
 
-exp_name=${high_res_list}_${high_res_probs}_${low_res_list}_${low_res_probs}_controlnet_${controlnet_depth}_backbone_${backbone_depth}
+exp_name=${high_res_list}_${high_res_probs}_${low_res_list}_${low_res_probs}_controlnet_${controlnet_depth}_backbone_${backbone_depth}_snr_${snr_type}_0.5_1_cnet_snr_uniform_cfg_1.0_wo_noise_wo_shift
 mkdir -p results/"$exp_name"
 
 # unset NCCL_IB_HCA

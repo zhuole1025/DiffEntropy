@@ -23,7 +23,7 @@ from flux.model import Flux, FluxParams
 from flux.sampling import prepare
 from flux.util import configs, load_clip, load_t5, load_flow_model
 from transport import Sampler, create_transport
-from imgproc import generate_crop_size_list, to_rgb_if_rgba, var_center_crop
+from imgproc import generate_crop_size_list, to_rgb_if_rgba, var_center_crop, apply_histogram_matching
 
 
 def none_or_str(value):
@@ -108,6 +108,7 @@ def main(args, rank, master_port):
         atol=args.atol,
         rtol=args.rtol,
         reverse=args.reverse,
+        do_shift=args.do_shift,
         time_shifting_factor=args.time_shifting_factor,
     )
     # end sampler
@@ -212,7 +213,7 @@ def main(args, rank, master_port):
                         y=inp["vec"],
                         txt_mask=inp["txt_mask"],
                         img_mask=inp["img_mask"],
-                        guidance=torch.full((x.shape[0],), 0.0, device=x.device, dtype=x.dtype),
+                        guidance=torch.full((x.shape[0],), 1.0, device=x.device, dtype=x.dtype),
                     )
 
                     samples = sample_fn(
@@ -235,6 +236,9 @@ def main(args, rank, master_port):
                     for i, (sample, cap) in enumerate(zip(samples, caps_list)):
                         
                         img = to_pil_image(sample.float())
+                        img = apply_histogram_matching(img, image)
+                        # convert img from numpy to PIL Image
+                        img = Image.fromarray(img.astype('uint8'), 'RGB')
                         save_path = f"{args.image_save_path}/images/{args.solver}_{args.num_sampling_steps}_{sample_id}.jpg"
                         img.save(save_path, format='JPEG', quality=95)
                         

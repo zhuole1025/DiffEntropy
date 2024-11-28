@@ -94,6 +94,7 @@ def main(args, rank, master_port):
         atol=args.atol,
         rtol=args.rtol,
         reverse=args.reverse,
+        do_shift=args.do_shift,
         time_shifting_factor=args.time_shifting_factor,
     )
     # end sampler

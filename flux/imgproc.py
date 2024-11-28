@@ -94,3 +94,37 @@ def to_rgb_if_rgba(img: Image.Image):
         return rgb_img
     else:
         return img
+
+def match_histograms(source, reference):
+    src_hist, _ = np.histogram(source.ravel(), 256, [0,256])
+    src_cdf = np.cumsum(src_hist) / float(src_hist.sum())
+    ref_hist, _ = np.histogram(reference.ravel(), 256, [0,256])
+    ref_cdf = np.cumsum(ref_hist) / float(ref_hist.sum())
+
+    # Create a lookup table to map pixel values in the source
+    # to their corresponding values in the target
+    lut = np.interp(src_cdf, ref_cdf, np.arange(256))
+
+    return lut[source]
+
+def apply_histogram_matching(upscaled, original):
+    """
+    Apply histogram matching for each channel of the RGB image
+    """
+    if isinstance(upscaled, Image.Image):
+        upscaled = np.array(upscaled)
+        # upscaled = cv2.cvtColor(upscaled, cv2.COLOR_BGR2RGB)
+    else:
+        upscaled = cv2.cvtColor(upscaled, cv2.COLOR_BGR2RGB)
+
+    if isinstance(original, Image.Image):
+        original = np.array(original)
+        # original = cv2.cvtColor(original, cv2.COLOR_BGR2RGB)
+    else:
+        upscaled = cv2.cvtColor(upscaled, cv2.COLOR_BGR2RGB)
+
+
+    matched = np.zeros_like(upscaled)
+    for channel in range(3):
+        matched[:,:,channel] = match_histograms(upscaled[:,:,channel], original[:,:,channel])
+    return matched
