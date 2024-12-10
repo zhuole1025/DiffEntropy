@@ -45,13 +45,13 @@ from torch.distributed.fsdp import (
 from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
 from diffusers import AutoencoderKL
 
 from data import ItemProcessor, MyDataset
 from flux.sampling import prepare
 from flux.util import load_ae, load_clip, load_flow_model, load_t5, load_controlnet
+from flux.modules.image_embedders import ReduxImageEncoder
 from imgproc import generate_crop_size_list, to_rgb_if_rgba, var_center_crop
 from parallel import distributed_init, get_intra_node_process_group
 from transport import create_transport
@@ -62,10 +62,17 @@ from util.misc import SmoothedValue
 #############################################################################
 
 
+def invert_transform(x):
+    x = x * 0.5 + 0.5
+    x = torch.clamp(x, 0, 1)
+    x = transforms.ToPILImage()(x)
+    return x
+
 
 class T2IItemProcessor(ItemProcessor):
-    def __init__(self, transform):
+    def __init__(self, transform, transform_2=None):
         self.image_transform = transform
+        self.image_transform_2 = transform_2
 
     def process_item(self, data_item, training_mode=False):
         text_emb = None
@@ -77,8 +84,8 @@ class T2IItemProcessor(ItemProcessor):
             image_path = data_item["path"]
             image = Image.open(image_path).convert("RGB")
             text = data_item["gpt_4_caption"]
-            if "text_embeddings_path" in data_item:
-                text_emb = load_file(data_item["text_embeddings_path"], device="cpu")
+            # if "text_embeddings_path" in data_item:
+                # text_emb = load_file(data_item["text_embeddings_path"], device="cpu")
         elif "image_url" in data_item:
             url = data_item["image_url"]
             url = url.replace(
@@ -115,7 +122,13 @@ class T2IItemProcessor(ItemProcessor):
         else:
             raise ValueError(f"Unrecognized item: {data_item}")
 
-        image = self.image_transform(image)
+        if self.image_transform_2 is not None:
+            if random.random() < 0.5:
+                image = self.image_transform(image)
+            else:
+                image = self.image_transform_2(image)
+        else:
+            image = self.image_transform(image)
 
         return image, text, text_emb
 
@@ -129,6 +142,8 @@ def dataloader_collate_fn(samples):
     image = [x[0] for x in samples]
     caps = [x[1] for x in samples]
     text_emb = [x[2] for x in samples]
+    if all(x is None for x in text_emb):
+        text_emb = None
     return image, caps, text_emb
 
 
@@ -287,11 +302,6 @@ def main(args):
     if rank == 0:
         logger = create_logger(args.results_dir)
         logger.info(f"Experiment directory: {args.results_dir}")
-        tb_logger = SummaryWriter(
-            os.path.join(
-                args.results_dir, "tensorboard", datetime.now().strftime("%Y%m%d_%H%M%S_") + socket.gethostname()
-            )
-        )
         # Create wandb logger
         if args.use_wandb:
             wandb.init(
@@ -304,7 +314,6 @@ def main(args):
             )
     else:
         logger = create_logger(None)
-        tb_logger = None
 
     logger.info("Training arguments: " + json.dumps(args.__dict__, indent=2))
 
@@ -338,6 +347,13 @@ def main(args):
     ae.requires_grad_(False)
     logger.info(f"VAE loaded")
     
+    if args.img_embedder_path is not None:
+        img_embedder = ReduxImageEncoder(device=device_str, redux_path=args.img_embedder_path)
+        img_embedder.requires_grad_(False)
+        logger.info(f"Image embedder loaded")
+    else:
+        img_embedder = None
+    
     model = load_flow_model("flux-dev", device=device_str, dtype=torch.bfloat16, attn_token_select=args.attn_token_select, mlp_token_select=args.mlp_token_select, zero_init=args.zero_init)
     # for block in model.double_blocks:
         # block.init_cond_weights()
@@ -356,7 +372,7 @@ def main(args):
         else:
             param.requires_grad = False
     
-    controlnet = load_controlnet("flux-dev", device=device_str, dtype=torch.bfloat16, transformer=model, controlnet_depth=args.controlnet_depth, backbone_depth=args.backbone_depth)
+    controlnet = load_controlnet("flux-dev", device=device_str, dtype=torch.bfloat16, transformer=model, double_depth=args.double_depth, single_depth=args.single_depth, backbone_depth=args.backbone_depth, backbone_depth_single=args.backbone_depth_single, compute_loss=args.compute_controlnet_loss)
     controlnet.train()
     controlnet_params = controlnet_params + [p for p in controlnet.parameters() if p.requires_grad]
     
@@ -575,10 +591,18 @@ def main(args):
                 transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
             ]
         )
+        image_transform_2 = transforms.Compose(
+            [
+                transforms.Lambda(lambda img: to_rgb_if_rgba(img)),
+                transforms.Lambda(functools.partial(var_center_crop, crop_size_list=crop_size_list, random_top_k=1, is_tiled=True)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
+            ]
+        )
         dataset = MyDataset(
             args.data_path,
             train_res=train_res if not args.debug else None,
-            item_processor=T2IItemProcessor(image_transform),
+            item_processor=T2IItemProcessor(image_transform, image_transform_2),
             cache_on_disk=args.cache_data_on_disk,
         )
         logger.info(f"Dataset for {train_res} contains {len(dataset):,} images ({args.data_path})")
@@ -644,6 +668,10 @@ def main(args):
                     mode="bilinear", align_corners=False
                 )[0] for img in x
             ]
+            if img_embedder is not None:
+                raw_x_cond = [invert_transform(img) for img in x_cond]
+            else:
+                raw_x_cond = None
             x_cond = [(ae.encode(img[None].to(ae.dtype)).latent_dist.sample()[0] - ae.config.shift_factor) * ae.config.scaling_factor for img in x_cond]
             if high_res > 3072:
                 x = [(ae.tiled_encode(img[None].to(ae.dtype)).latent_dist.sample()[0] - ae.config.shift_factor) * ae.config.scaling_factor for img in x]
@@ -651,9 +679,10 @@ def main(args):
                 x = [(ae.encode(img[None].to(ae.dtype)).latent_dist.sample()[0] - ae.config.shift_factor) * ae.config.scaling_factor for img in x]
             
         with torch.no_grad():
-            inp = prepare(t5=t5, clip=clip, img=x, img_cond=x_cond, prompt=caps, proportion_empty_prompts=args.caption_dropout_prob, proportion_empty_images=args.image_dropout_prob, text_emb=text_emb)
+            inp = prepare(t5=t5, clip=clip, img=x, img_cond=x_cond, prompt=caps, proportion_empty_prompts=args.caption_dropout_prob, proportion_empty_images=args.image_dropout_prob, text_emb=text_emb, img_embedder=img_embedder, raw_img_cond=raw_x_cond)
 
         loss_item = 0.0
+        controlnet_loss_item = 0.0
         opt.zero_grad()
         
         # Number of bins, for loss recording
@@ -678,7 +707,6 @@ def main(args):
                 txt_mask=inp["txt_mask"][mb_st:mb_ed],
                 y=inp["vec"][mb_st:mb_ed],
                 img_mask=inp["img_mask"][mb_st:mb_ed],
-                img_cond_mask=inp["img_cond_mask"][mb_st:mb_ed],
                 guidance=torch.full((x_mb.shape[0],), 1.0, device=x_mb.device, dtype=x_mb.dtype),
             )
             
@@ -691,6 +719,7 @@ def main(args):
                 txt_mask=inp["txt_mask"][mb_st:mb_ed],
                 img_mask=inp["img_mask"][mb_st:mb_ed],
                 guidance=torch.full((x_mb.shape[0],), 1.0, device=x_mb.device, dtype=x_mb.dtype),
+                controlnet_snr=args.controlnet_snr,
             )
             
             with {
@@ -702,6 +731,12 @@ def main(args):
                 loss_dict = data_pack["transport"].training_losses(model, x_mb, model_kwargs, controlnet=controlnet, controlnet_kwargs=controlnet_kwargs)
             loss = loss_dict["loss"].sum() / data_pack["local_bsz"]
             loss_item += loss.item()
+            if args.compute_controlnet_loss:
+                controlnet_loss = loss_dict["controlnet_loss"].sum() / data_pack["local_bsz"]
+                controlnet_loss_item += controlnet_loss.item()
+            else:
+                controlnet_loss_item += 0.0
+            
             with model.no_sync() if args.data_parallel in ["sdp"] and not last_mb else contextlib.nullcontext():
                 loss.backward()
                 
@@ -728,15 +763,10 @@ def main(args):
         dist.all_reduce(bin_occurrence)
         dist.all_reduce(bin_sum_loss)
 
-        if tb_logger is not None:
-            tb_logger.add_scalar(f"train/loss", loss_item, step)
-            tb_logger.add_scalar(f"train/grad_norm", grad_norm, step)
-            tb_logger.add_scalar(f"train/controlnet_grad_norm", controlnet_grad_norm, step)
-            tb_logger.add_scalar(f"train/lr", opt.param_groups[0]["lr"], step)
-                
         if args.use_wandb and rank == 0:
             log_dict = {
                 "train/loss": loss_item,
+                "train/controlnet_loss": controlnet_loss_item,
                 "train/grad_norm": grad_norm,
                 "train/controlnet_grad_norm": controlnet_grad_norm,
                 "train/lr": opt.param_groups[0]["lr"],
@@ -753,6 +783,7 @@ def main(args):
         # Log loss values:
         metrics = data_pack["metrics"]
         metrics["loss"].update(loss_item)
+        metrics["controlnet_loss"].update(controlnet_loss_item)
         metrics["grad_norm"].update(grad_norm)
         metrics["controlnet_grad_norm"].update(controlnet_grad_norm)
         metrics["Secs/Step"].update(end_time - start_time)
@@ -875,20 +906,13 @@ def main(args):
 
 
 if __name__ == "__main__":
-    # Default args here will train DiT_Llama2_7B_patch2 with the
-    # hyperparameters we used in our paper (except training iters).
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_path", type=str, required=True)
     parser.add_argument("--cache_data_on_disk", default=False, action="store_true")
     parser.add_argument("--results_dir", type=str, required=True)
     parser.add_argument("--max_steps", type=int, default=100_000, help="Number of training steps.")
-    # parser.add_argument("--global_bsz_256", type=int, default=256)
-    # parser.add_argument("--micro_bsz_256", type=int, default=1)
-    # parser.add_argument("--image_size", type=int, default=512)
     parser.add_argument("--global_bsz", type=int, default=256)
     parser.add_argument("--micro_bsz", type=int, default=1)
-    # parser.add_argument("--global_bsz_1024", type=int, default=256)
-    # parser.add_argument("--micro_bsz_1024", type=int, default=1)
     parser.add_argument("--load_t5", action="store_true")
     parser.add_argument("--load_clip", action="store_true")
     parser.add_argument("--global_seed", type=int, default=0)
@@ -968,8 +992,13 @@ if __name__ == "__main__":
         default="0.2,0.7,0.1",
         help="Comma-separated list of probabilities for sampling low resolution images."
     )
-    parser.add_argument("--controlnet_depth", type=int, default=2)
+    parser.add_argument("--compute_controlnet_loss", action="store_true")
+    parser.add_argument("--controlnet_snr", type=str, default=None)
+    parser.add_argument("--img_embedder_path", type=str, default=None)
+    parser.add_argument("--double_depth", type=int, default=2)
+    parser.add_argument("--single_depth", type=int, default=0)
     parser.add_argument("--backbone_depth", type=int, default=19)
+    parser.add_argument("--backbone_depth_single", type=int, default=0)
     parser.add_argument("--full_model", action="store_true")
     parser.add_argument("--token_target_ratio", type=float, default=0.5)
     parser.add_argument("--token_loss_weight", type=float, default=1.0)

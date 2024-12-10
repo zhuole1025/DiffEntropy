@@ -14,8 +14,11 @@ low_res_probs=1.0
 high_res_list=1024
 high_res_probs=1.0
 snr_type=lognorm
-controlnet_depth=6
+double_depth=2
+single_depth=4
 backbone_depth=19
+backbone_depth_single=38
+img_embedder_path='/data/huggingface/hub/models--black-forest-labs--FLUX.1-Redux-dev/snapshots/1282f955f706b5240161278f2ef261d2a29ad649/flux1-redux-dev.safetensors'
 
 exp_name=test
 mkdir -p results/"$exp_name"
@@ -35,7 +38,7 @@ CUDA_VISIBLE_DEVICES=7 torchrun --nproc_per_node=1 --nnodes=1 --master_port 2933
     --ckpt_every 1000 --log_every 1 \
     --precision ${precision} --grad_precision fp32 \
     --global_seed 20240826 \
-    --num_workers 1 \
+    --num_workers 0 \
     --cache_data_on_disk \
     --snr_type ${snr_type} \
     --checkpointing \
@@ -43,9 +46,11 @@ CUDA_VISIBLE_DEVICES=7 torchrun --nproc_per_node=1 --nnodes=1 --master_port 2933
     --high_res_probs ${high_res_probs} \
     --low_res_list ${low_res_list} \
     --low_res_probs ${low_res_probs} \
-    --controlnet_depth ${controlnet_depth} \
+    --double_depth ${double_depth} \
+    --single_depth ${single_depth} \
     --backbone_depth ${backbone_depth} \
+    --backbone_depth_single ${backbone_depth_single} \
+    --img_embedder_path ${img_embedder_path} \
+    --use_clip \
     --debug \
-    # --zero_init \
-    # --use_wandb
     

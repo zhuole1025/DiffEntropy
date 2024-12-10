@@ -102,7 +102,10 @@ class Flux(nn.Module):
         img_cond_ids: Tensor = None,
         img_mask: Tensor = None,
         img_cond_mask: Tensor = None,
-        controls: tuple = None,
+        double_controls: list = None,
+        single_controls: list = None,
+        double_gate: float = 1.0,
+        single_gate: float = 1.0,
     ) -> Tensor:
         if img.ndim != 3 or txt.ndim != 3:
             raise ValueError("Input img and txt tensors must have 3 dimensions.")
@@ -131,10 +134,10 @@ class Flux(nn.Module):
                 token_select_list.append(sub_token_select)
                 token_logits_list.append(token_logits)
             # controlnet residual
-            if controls is not None:
+            if double_controls is not None:
                 # gate = torch.tanh(self.controlnet_gates[idx](torch.cat((img, img + controls[idx % len(controls)]), dim=-1), vec))
                 # print(timesteps[0].item(), idx, gate.abs().mean().item(), gate.abs().var().item(), (controls[idx % len(controls)] * gate).mean().item(), img.mean().item())
-                img = img + controls[idx % len(controls)]
+                img = img + double_controls[idx % len(double_controls)] * double_gate
                 # gate_logits_list.append(gate)
         
         # pe = pe[:, :, img_cond_ids.shape[1]:, ...]
@@ -145,6 +148,9 @@ class Flux(nn.Module):
             if (sub_token_select is not None) and (token_logits is not None):
                 token_select_list.append(sub_token_select)
                 token_logits_list.append(token_logits)
+            
+            if single_controls is not None:
+                img = img + single_controls[idx % len(single_controls)] * single_gate
                 
         # if img_cond is not None:
             # img = img[:, img_cond.shape[1] :, ...]
@@ -176,14 +182,17 @@ class Flux(nn.Module):
         img_cond_ids: Tensor = None,
         img_mask: Tensor = None,
         img_cond_mask: Tensor = None,
-        controls: tuple = None,
+        double_controls: list = None,
+        single_controls: list = None,
         txt_cfg_scale: float = 1.0,
         img_cfg_scale: float = 1.0,
+        double_gate: float = 1.0,
+        single_gate: float = 1.0,
     ) -> Tensor:
-        half = img[: len(img) // 3]
-        combined = torch.cat([half, half, half], dim=0)
+        # half = img[: len(img) // 3]
+        # combined = torch.cat([half, half, half], dim=0)
         model_out = self.forward(
-            img=combined, 
+            img=img, 
             timesteps=timesteps, 
             img_ids=img_ids, 
             img_cond=img_cond, 
@@ -195,13 +204,16 @@ class Flux(nn.Module):
             txt_mask=txt_mask, 
             img_mask=img_mask, 
             img_cond_mask=img_cond_mask, 
-            controls=controls
+            double_controls=double_controls,
+            single_controls=single_controls,
+            double_gate=double_gate,
+            single_gate=single_gate
         )["output"]
 
-        cond_v, txt_cond_v, uncond_v = torch.split(model_out, len(model_out) // 3, dim=0)
-        cond_v = txt_cond_v + txt_cfg_scale * (cond_v - txt_cond_v)
-        eps = torch.cat([cond_v, txt_cond_v, uncond_v], dim=0)
-        return eps
+        # cond_v, txt_cond_v, uncond_v = torch.split(model_out, len(model_out) // 3, dim=0)
+        # cond_v = txt_cond_v + txt_cfg_scale * (cond_v - txt_cond_v)
+        # eps = torch.cat([cond_v, txt_cond_v, uncond_v], dim=0)
+        return model_out
 
     def parameter_count(self) -> int:
         total_params = 0

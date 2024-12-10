@@ -2,7 +2,7 @@
 
 export WANDB_API_KEY="75de1215548653cdc8084ae0d1450f2d84fd9a20"
 export HF_TOKEN="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"
-export HF_HOME="/data/huggingface"
+export HF_HOME="/ceph/data-bk/huggingface"
 
 train_data_root='configs/data/2M.yaml'
 batch_size=8
@@ -14,10 +14,14 @@ low_res_probs=0.4,0.4,0.2
 high_res_list=1024
 high_res_probs=1.0
 snr_type=lognorm
-controlnet_depth=2
+controlnet_snr=uniform
+double_depth=2
+single_depth=4
 backbone_depth=19
+backbone_depth_single=38
+img_embedder_path='/data/huggingface/hub/models--black-forest-labs--FLUX.1-Redux-dev/snapshots/1282f955f706b5240161278f2ef261d2a29ad649/flux1-redux-dev.safetensors'
 
-exp_name=${high_res_list}_${high_res_probs}_${low_res_list}_${low_res_probs}_controlnet_${controlnet_depth}_backbone_${backbone_depth}_snr_${snr_type}_0.5_1_cnet_snr_uniform_cfg_1.0_wo_noise_wo_shift
+exp_name=${high_res_list}_${high_res_probs}_${low_res_list}_${low_res_probs}_controlnet_${double_depth}_${single_depth}_backbone_${backbone_depth}_${backbone_depth_single}_snr_${snr_type}_0.5_1_cnet_snr_${controlnet_snr}_cfg_1.0_wo_noise_wo_shift_lr_${lr}_cap_redux_tiled
 mkdir -p results/"$exp_name"
 
 # unset NCCL_IB_HCA
@@ -43,7 +47,15 @@ torchrun --nproc_per_node=8 --nnodes=1 --master_port 29311 train_controlnet.py \
     --low_res_list ${low_res_list} \
     --low_res_probs ${low_res_probs} \
     --use_wandb \
-    --controlnet_depth ${controlnet_depth} \
+    --double_depth ${double_depth} \
+    --single_depth ${single_depth} \
     --backbone_depth ${backbone_depth} \
+    --backbone_depth_single ${backbone_depth_single} \
+    --img_embedder_path ${img_embedder_path} \
+    --load_t5 \
+    --load_clip \
+    --controlnet_snr ${controlnet_snr} \
+    --caption_dropout_prob 0.5 \
+    # --compute_controlnet_loss \
     # --checkpointing \
     

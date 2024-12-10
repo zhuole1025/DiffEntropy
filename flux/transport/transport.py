@@ -164,18 +164,23 @@ class Transport:
         t, x0, x1 = self.sample(x1)
         t, xt, ut = self.path_sampler.plan(t, x0, x1)
         B = len(x0)
+        terms = {}
         
         if controlnet is not None:
             x1_controlnet = controlnet_kwargs.pop("controlnet_cond")
-            t_controlnet, x0_controlnet, x1_controlnet = self.sample(x1_controlnet, snr_type='uniform')
-            t_controlnet, xt_controlnet, ut_controlnet = self.path_sampler.plan(t_controlnet, x0_controlnet, x1_controlnet)
-            controls = controlnet(xt_controlnet, timesteps=1 - t_controlnet, bb_timesteps=1 - t, **controlnet_kwargs)
-            model_kwargs["controls"] = controls
+            controlnet_snr = controlnet_kwargs.pop("controlnet_snr", None)
+            if controlnet_snr is not None:
+                t_controlnet, x0_controlnet, x1_controlnet = self.sample(x1_controlnet, snr_type=controlnet_snr)
+                t_controlnet, xt_controlnet, ut_controlnet = self.path_sampler.plan(t_controlnet, x0_controlnet, x1_controlnet)
+                controlnet_out_dict = controlnet(xt_controlnet, timesteps=1 - t_controlnet, bb_timesteps=1 - t, **controlnet_kwargs)
+            else:
+                controlnet_out_dict = controlnet(x1_controlnet, timesteps=None, bb_timesteps=1 - t, **controlnet_kwargs)
+            model_kwargs["double_controls"] = controlnet_out_dict["double_block_feats"]
+            model_kwargs["single_controls"] = controlnet_out_dict["single_block_feats"]
             
         out_dict = model(xt, timesteps=1 - t, **model_kwargs)
         model_output = -out_dict["output"]  # todo check if this is all needed
         
-        terms = {}
         if self.model_type == ModelType.VELOCITY:
             if isinstance(x1, (list, tuple)):
                 assert len(model_output) == len(ut) == len(x1)
@@ -199,6 +204,16 @@ class Transport:
             raise NotImplementedError
         terms["loss"] = terms["task_loss"]
         terms["task_loss"] = terms["task_loss"].clone().detach()
+        
+        if controlnet is not None and "output" in controlnet_out_dict:
+            controlnet_output = controlnet_out_dict["output"]
+            B, L, D = controlnet_output.shape
+            img_mask = model_kwargs["img_mask"]
+            # Use L1 loss for controlnet
+            terms["controlnet_loss"] = (controlnet_output - x1) * img_mask.unsqueeze(-1)
+            terms["controlnet_loss"] = terms["controlnet_loss"].abs().sum(dim=list(range(1, controlnet_output.dim()))) / (img_mask.sum(dim=1) * D) * 0.5
+            terms["loss"] += terms["controlnet_loss"]
+            terms["controlnet_loss"] = terms["controlnet_loss"].clone().detach()
         
         if "gate_logits" in out_dict:
             gate_logits = out_dict["gate_logits"]

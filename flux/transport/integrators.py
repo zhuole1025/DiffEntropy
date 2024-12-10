@@ -113,8 +113,9 @@ class ode:
                 t_cond = th.ones(x_cond.size(0)).to(device) * 0.5
                 noise = th.randn_like(x_cond)
                 xt_cond = x_cond * t_cond.view(-1, 1, 1) + noise * (1 - t_cond).view(-1, 1, 1)
-                controls = controlnet(xt_cond, timesteps=1 - t_cond, bb_timesteps=1 - t, **controlnet_kwargs)
-                model_kwargs["controls"] = controls
+                controlnet_out_dict = controlnet(xt_cond, timesteps=1 - t_cond, bb_timesteps=1 - t, **controlnet_kwargs)
+                model_kwargs["double_controls"] = controlnet_out_dict["double_block_feats"]
+                model_kwargs["single_controls"] = controlnet_out_dict["single_block_feats"]
             model_output = self.drift(x, t, model, **model_kwargs)
             return model_output
 

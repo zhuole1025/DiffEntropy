@@ -132,7 +132,8 @@ def main(args, rank, master_port):
     with torch.autocast("cuda", dtype):
         for idx, item in tqdm(enumerate(data)):
             caps_list = [item["gpt_4_caption"]]
-            image = Image.open(os.path.join(args.root_path, item["path"]))
+            image_path = os.path.join(args.root_path, item["path"]) if args.root_path else item["path"]
+            image = Image.open(image_path)
             image = image.convert("RGB")
             
             for high_res in args.high_res_list:

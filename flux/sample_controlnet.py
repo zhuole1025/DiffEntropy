@@ -22,8 +22,16 @@ from flux.controlnet import ControlNetFlux
 from flux.model import Flux, FluxParams
 from flux.sampling import prepare
 from flux.util import configs, load_clip, load_t5, load_flow_model
+from flux.modules.image_embedders import ReduxImageEncoder
 from transport import Sampler, create_transport
-from imgproc import generate_crop_size_list, to_rgb_if_rgba, var_center_crop, apply_histogram_matching
+from imgproc import generate_crop_size_list, to_rgb_if_rgba, var_center_crop, apply_histogram_matching, apply_statistical_color_matching
+
+
+def invert_transform(x):
+    x = x * 0.5 + 0.5
+    x = torch.clamp(x, 0, 1)
+    x = transforms.ToPILImage()(x)
+    return x
 
 
 def none_or_str(value):
@@ -55,7 +63,14 @@ def main(args, rank, master_port):
     print("Init controlnet")
     params = configs[args.model].params
     with torch.device(device_str):
-        controlnet = ControlNetFlux(params, controlnet_depth=train_args.controlnet_depth, backbone_depth=train_args.backbone_depth).to(dtype)
+        controlnet = ControlNetFlux(
+            params, 
+            double_depth=args.double_depth, 
+            single_depth=args.single_depth, 
+            backbone_depth=args.backbone_depth, 
+            backbone_depth_single=args.backbone_depth_single,
+            compute_loss=args.compute_controlnet_loss
+        ).to(dtype)
     controlnet.eval()
     
     print("Init model")
@@ -72,6 +87,13 @@ def main(args, rank, master_port):
     print("Init text encoder")
     t5 = load_t5(device_str, max_length=args.max_length)
     clip = load_clip(device_str)
+    
+    if args.img_embedder_path is not None:
+        img_embedder = ReduxImageEncoder(device=device_str, redux_path=args.img_embedder_path)
+        img_embedder.requires_grad_(False)
+        print(f"Image embedder loaded")
+    else:
+        img_embedder = None
         
     # model.eval().to(device_str, dtype=dtype)
 
@@ -174,23 +196,31 @@ def main(args, rank, master_port):
                     x_cond = F.interpolate(x_cond[None], size=(h, w), mode="bilinear", align_corners=False)[0]
                     up_scale = 1
                     
+                    if img_embedder is not None:
+                        raw_x_cond = invert_transform(x_cond)
+                        raw_x_cond = [raw_x_cond]
+                        # raw_x_cond = [raw_x_cond, raw_x_cond.copy(), raw_x_cond.copy()]
+                    else:
+                        raw_x_cond = None
+                    
                     with torch.no_grad():
                         x_cond = (ae.encode(x_cond[None].to(ae.dtype)).latent_dist.sample()[0] - ae.config.shift_factor) * ae.config.scaling_factor
-                    x_cond = torch.stack([x_cond, torch.zeros_like(x_cond, device=x_cond.device, dtype=x_cond.dtype), torch.zeros_like(x_cond, device=x_cond.device, dtype=x_cond.dtype)])
+                    x_cond = x_cond[None]
+                    # x_cond = torch.stack([x_cond, torch.zeros_like(x_cond, device=x_cond.device, dtype=x_cond.dtype), torch.zeros_like(x_cond, device=x_cond.device, dtype=x_cond.dtype)])
                     
                     low_h, low_w = x_cond.shape[-2:]
                     h, w = low_h * up_scale, low_w * up_scale
                     n = len(caps_list)
                     x = torch.randn([1, 16, h, w], device=device_str).to(dtype)
-                    x = x.repeat(n * 3, 1, 1, 1)
+                    # x = x.repeat(n * 3, 1, 1, 1)
                     with torch.no_grad():
-                        inp = prepare(t5=t5, clip=clip, img=x, img_cond=x_cond, prompt=[caps_list] + [caps_list] + [""], proportion_empty_prompts=0.0, proportion_empty_images=0.0)
+                        inp = prepare(t5=t5, clip=clip, img=x, img_cond=x_cond, prompt=[caps_list], proportion_empty_prompts=0.0, proportion_empty_images=0.0, raw_img_cond=raw_x_cond, img_embedder=img_embedder, is_training=False)
                     
                     if args.drop_cond:
                         inp["img_cond"] = None
                         inp["img_cond_ids"] = None
                         inp["img_cond_mask"] = None
-
+                    
                     model_kwargs = dict(
                         txt=inp["txt"], 
                         txt_ids=inp["txt_ids"], 
@@ -202,7 +232,9 @@ def main(args, rank, master_port):
                         img_mask=inp["img_mask"], 
                         img_cond_mask=inp["img_cond_mask"], 
                         guidance=torch.full((x.shape[0],), 4.0, device=x.device, dtype=x.dtype), txt_cfg_scale=args.txt_cfg_scale, 
-                        img_cfg_scale=args.img_cfg_scale
+                        img_cfg_scale=args.img_cfg_scale,
+                        double_gate=args.double_gate,
+                        single_gate=args.single_gate
                     )
                     
                     controlnet_kwargs = dict(
@@ -236,9 +268,9 @@ def main(args, rank, master_port):
                     for i, (sample, cap) in enumerate(zip(samples, caps_list)):
                         
                         img = to_pil_image(sample.float())
-                        img = apply_histogram_matching(img, image)
+                        # img = apply_statistical_color_matching(img, image)
                         # convert img from numpy to PIL Image
-                        img = Image.fromarray(img.astype('uint8'), 'RGB')
+                        # img = Image.fromarray(img.astype('uint8'), 'RGB')
                         save_path = f"{args.image_save_path}/images/{args.solver}_{args.num_sampling_steps}_{sample_id}.jpg"
                         img.save(save_path, format='JPEG', quality=95)
                         
@@ -365,6 +397,14 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--max_length", type=int, default=512, help="Max length for T5.")
     parser.add_argument("--root_path", type=str, default="")
+    parser.add_argument("--double_depth", type=int, default=2)
+    parser.add_argument("--single_depth", type=int, default=0)
+    parser.add_argument("--backbone_depth", type=int, default=19)
+    parser.add_argument("--backbone_depth_single", type=int, default=0)
+    parser.add_argument("--double_gate", type=float, default=1.0)
+    parser.add_argument("--single_gate", type=float, default=1.0)
+    parser.add_argument("--img_embedder_path", type=str, default=None)
+    parser.add_argument("--compute_controlnet_loss", action="store_true")
     args = parser.parse_known_args()[0]
     
     args.low_res_list = [int(res) for res in args.low_res_list.split(",")]

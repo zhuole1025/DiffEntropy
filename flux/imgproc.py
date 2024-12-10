@@ -22,12 +22,13 @@ def center_crop_arr(pil_image, image_size):
     return Image.fromarray(arr[crop_y : crop_y + image_size, crop_x : crop_x + image_size])
 
 
-def center_crop(pil_image, crop_size):
-    while pil_image.size[0] >= 2 * crop_size[0] and pil_image.size[1] >= 2 * crop_size[1]:
-        pil_image = pil_image.resize(tuple(x // 2 for x in pil_image.size), resample=Image.BOX)
+def center_crop(pil_image, crop_size, is_tiled=False):
+    if not is_tiled:
+        while pil_image.size[0] >= 2 * crop_size[0] and pil_image.size[1] >= 2 * crop_size[1]:
+            pil_image = pil_image.resize(tuple(x // 2 for x in pil_image.size), resample=Image.BOX)
 
-    scale = max(crop_size[0] / pil_image.size[0], crop_size[1] / pil_image.size[1])
-    pil_image = pil_image.resize(tuple(round(x * scale) for x in pil_image.size), resample=Image.BICUBIC)
+        scale = max(crop_size[0] / pil_image.size[0], crop_size[1] / pil_image.size[1])
+        pil_image = pil_image.resize(tuple(round(x * scale) for x in pil_image.size), resample=Image.BICUBIC)
 
     crop_left = random.randint(0, pil_image.size[0] - crop_size[0])
     crop_upper = random.randint(0, pil_image.size[1] - crop_size[1])
@@ -48,13 +49,20 @@ def pad(pil_image, pad_size):
     return new_image
 
 
-def var_center_crop(pil_image, crop_size_list, random_top_k=4):
+def var_center_crop(pil_image, crop_size_list, random_top_k=4, is_tiled=False):
     w, h = pil_image.size
-    rem_percent = [min(cw / w, ch / h) / max(cw / w, ch / h) for cw, ch in crop_size_list]
-    crop_size = random.choice(
-        sorted(((x, y) for x, y in zip(rem_percent, crop_size_list)), reverse=True)[:random_top_k]
-    )[1]
-    return center_crop(pil_image, crop_size)
+    pre_crop_size_list = [
+        (cw, ch) for cw, ch in crop_size_list if cw <= w and ch <= h
+    ]
+    if is_tiled and len(pre_crop_size_list) > 0:
+        crop_size = random.choice(pre_crop_size_list)
+    else:
+        is_tiled = False
+        rem_percent = [min(cw / w, ch / h) / max(cw / w, ch / h) for cw, ch in crop_size_list]
+        crop_size = random.choice(
+            sorted(((x, y) for x, y in zip(rem_percent, crop_size_list)), reverse=True)[:random_top_k]
+        )[1]
+    return center_crop(pil_image, crop_size, is_tiled)
 
 
 def var_pad(pil_image, pad_size_list, random_top_k=4):
@@ -127,4 +135,36 @@ def apply_histogram_matching(upscaled, original):
     matched = np.zeros_like(upscaled)
     for channel in range(3):
         matched[:,:,channel] = match_histograms(upscaled[:,:,channel], original[:,:,channel])
+    return matched
+
+def apply_statistical_color_matching(upscaled, original):
+    """
+    Match colors between upscaled and original images using mean and standard deviation.
+    Applies the transformation independently for each RGB channel.
+    """
+    if isinstance(upscaled, Image.Image):
+        upscaled = np.array(upscaled, dtype=np.float32)
+    else:
+        upscaled = cv2.cvtColor(upscaled, cv2.COLOR_BGR2RGB).astype(np.float32)
+
+    if isinstance(original, Image.Image):
+        original = np.array(original, dtype=np.float32)
+    else:
+        original = cv2.cvtColor(original, cv2.COLOR_BGR2RGB).astype(np.float32)
+
+    matched = np.zeros_like(upscaled)
+    
+    # Process each channel independently
+    for channel in range(3):
+        up_mean = np.mean(upscaled[:,:,channel])
+        up_std = np.std(upscaled[:,:,channel])
+        orig_mean = np.mean(original[:,:,channel])
+        orig_std = np.std(original[:,:,channel])
+        
+        # Normalize, scale, and shift
+        matched[:,:,channel] = (((upscaled[:,:,channel] - up_mean) / up_std) 
+                               * orig_std + orig_mean)
+    
+    # Clip values to valid range [0, 255]
+    matched = np.clip(matched, 0, 255)
     return matched

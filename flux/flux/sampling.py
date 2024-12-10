@@ -1,5 +1,6 @@
 import math
 import random
+from PIL import Image
 from typing import Callable
 
 from einops import rearrange, repeat
@@ -9,6 +10,7 @@ import torch.nn.functional as F
 
 from .model import Flux
 from .modules.conditioner import HFEmbedder
+from .modules.image_embedders import ReduxImageEncoder
 
 
 def get_noise(
@@ -31,7 +33,7 @@ def get_noise(
     )
 
 
-def prepare(t5: HFEmbedder, clip: HFEmbedder, img: Tensor, img_cond: Tensor, prompt: str | list[str], proportion_empty_prompts: float = 0.1, proportion_empty_images: float = 0.3, is_train: bool = True, text_emb: list[dict[str, Tensor]] = None) -> dict[str, Tensor]:
+def prepare(t5: HFEmbedder, clip: HFEmbedder, img: Tensor, img_cond: Tensor, prompt: str | list[str], proportion_empty_prompts: float = 0.1, proportion_empty_images: float = 0.0, is_train: bool = True, text_emb: list[dict[str, Tensor]] = None, img_embedder: ReduxImageEncoder = None, raw_img_cond: list[Image.Image] = None, is_training: bool = True) -> dict[str, Tensor]:
     if isinstance(img, torch.Tensor):
         bs, c, h, w = img.shape
         _, _, h_cond, w_cond = img_cond.shape
@@ -119,17 +121,29 @@ def prepare(t5: HFEmbedder, clip: HFEmbedder, img: Tensor, img_cond: Tensor, pro
         txt = torch.stack([item["txt"] for item in text_emb], dim=0).to(img.device)
     else:
         txt = t5(prompt)
-    if txt.shape[0] == 1 and bs > 1:
-        txt = repeat(txt, "1 ... -> bs ...", bs=bs)
+
+    if img_embedder is not None:
+        with torch.no_grad():
+            global_img_cond = [img_embedder(raw_img_cond[i]) for i in range(bs)]
+        global_img_cond = torch.cat(global_img_cond, dim=0).to(img.device)
+        
+        if not is_training:
+            txt = torch.cat([txt, global_img_cond], dim=1) # prompt + image
+            # txt = txt
+        elif random.random() < 0.3:
+            txt = torch.cat([txt, global_img_cond], dim=1) # prompt + image
+        elif random.random() < 0.6:
+            txt = global_img_cond # image only
+        else:
+            txt = txt # prompt only
+
     txt_ids = torch.zeros(bs, txt.shape[1], 3)
     txt_mask = torch.ones(bs, txt.shape[1], device=txt.device, dtype=torch.int32)
-
+        
     if text_emb is not None:
         vec = torch.stack([item["vec"] for item in text_emb], dim=0).to(img.device)
     else:
         vec = clip(prompt)
-    if vec.shape[0] == 1 and bs > 1:
-        vec = repeat(vec, "1 ... -> bs ...", bs=bs)
 
     return {
         "img": img,

@@ -48,7 +48,7 @@ def _upad_input(query_layer, key_layer, value_layer, query_mask, key_mask, query
     else:
         # The -q_len: slice assumes left padding.
         query_mask = query_mask[:, -query_length:]
-        query_layer, indices_q, cu_seqlens_q, max_seqlen_in_batch_q = unpad_input(query_layer, query_mask)
+        query_layer, indices_q, cu_seqlens_q, max_seqlen_in_batch_q, _ = unpad_input(query_layer, query_mask)
 
     return (
         query_layer,
