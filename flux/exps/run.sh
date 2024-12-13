@@ -13,15 +13,17 @@ low_res_list=256,128,64
 low_res_probs=0.4,0.4,0.2
 high_res_list=1024
 high_res_probs=1.0
-snr_type=lognorm
-controlnet_snr=uniform
+snr_type=uniform
+controlnet_snr=none
+backbone_cfg=4.0
+controlnet_cfg=4.0
 double_depth=2
 single_depth=4
 backbone_depth=19
 backbone_depth_single=38
 img_embedder_path='/data/huggingface/hub/models--black-forest-labs--FLUX.1-Redux-dev/snapshots/1282f955f706b5240161278f2ef261d2a29ad649/flux1-redux-dev.safetensors'
 
-exp_name=${high_res_list}_${high_res_probs}_${low_res_list}_${low_res_probs}_controlnet_${double_depth}_${single_depth}_backbone_${backbone_depth}_${backbone_depth_single}_snr_${snr_type}_0.5_1_cnet_snr_${controlnet_snr}_cfg_1.0_wo_noise_wo_shift_lr_${lr}_cap_redux_tiled
+exp_name=${high_res_list}_${high_res_probs}_${low_res_list}_${low_res_probs}_depth_${double_depth}_${single_depth}_${backbone_depth}_${backbone_depth_single}_snr_${snr_type}_${controlnet_snr}_cfg_${backbone_cfg}_${controlnet_cfg}_wo_shift_lr_${lr}_cap_redux_tiled_multi_degradation_wo_noise
 mkdir -p results/"$exp_name"
 
 # unset NCCL_IB_HCA
@@ -52,10 +54,12 @@ torchrun --nproc_per_node=8 --nnodes=1 --master_port 29311 train_controlnet.py \
     --backbone_depth ${backbone_depth} \
     --backbone_depth_single ${backbone_depth_single} \
     --img_embedder_path ${img_embedder_path} \
+    --backbone_cfg ${backbone_cfg} \
+    --controlnet_cfg ${controlnet_cfg} \
     --load_t5 \
     --load_clip \
-    --controlnet_snr ${controlnet_snr} \
     --caption_dropout_prob 0.5 \
+    # --controlnet_snr ${controlnet_snr} \
     # --compute_controlnet_loss \
     # --checkpointing \
     

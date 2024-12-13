@@ -58,10 +58,10 @@ def sample_ode(
         t = torch.ones(x.size(0)).to(device) * t
         if controlnet is not None:
             # t_cond = torch.ones(x_cond.size(0)).to(device) * t * 0.5 + 0.5
-            t_cond = torch.ones(x_cond.size(0)).to(device) * 0.5
-            noise = torch.randn_like(x_cond)
-            xt_cond = x_cond * t_cond.view(-1, 1, 1) + noise * (1 - t_cond).view(-1, 1, 1)
-            controlnet_out_dict = controlnet(xt_cond, timesteps=1 - t_cond, bb_timesteps=1 - t, **controlnet_kwargs)
+            # t_cond = torch.ones(x_cond.size(0)).to(device) * 0.5
+            # noise = torch.randn_like(x_cond)
+            # xt_cond = x_cond * t_cond.view(-1, 1, 1) + noise * (1 - t_cond).view(-1, 1, 1)
+            controlnet_out_dict = controlnet(x_cond, timesteps=None, bb_timesteps=1 - t, **controlnet_kwargs)
             model_kwargs["double_controls"] = controlnet_out_dict["double_block_feats"]
             model_kwargs["single_controls"] = controlnet_out_dict["single_block_feats"]
         model_output = -model(x, 1 - t, **model_kwargs)
@@ -236,10 +236,6 @@ def main(args, rank=0):
 
     torch.cuda.set_device(rank)
     device_str = f"cuda:{rank}"
-
-    train_args = torch.load(os.path.join(args.ckpt, "model_args.pth"))
-    print("Loaded model arguments:", json.dumps(train_args.__dict__, indent=2))
-
     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[args.precision]
 
     print("Init controlnet")
@@ -247,20 +243,16 @@ def main(args, rank=0):
     with torch.device(device_str):
         controlnet = ControlNetFlux(
             params, 
-            double_depth=train_args.double_depth, 
-            single_depth=train_args.single_depth, 
-            backbone_depth=train_args.backbone_depth, 
-            backbone_depth_single=train_args.backbone_depth_single,
+            double_depth=2, 
+            single_depth=4, 
+            backbone_depth=19, 
+            backbone_depth_single=38,
             compute_loss=False,
         ).to(dtype)
     controlnet.eval()
     
     print("Init model")
-    params.attn_token_select = False
-    params.mlp_token_select = False
-    params.zero_init = False
-    with torch.device(device_str):
-        model = Flux(params).to(dtype)
+    model = load_flow_model("flux-dev", device=device_str, dtype=dtype)
     model.eval()
         
     print("Init vae")
@@ -324,6 +316,8 @@ def main(args, rank=0):
         num_sampling_steps=args.num_sampling_steps,
         do_shift=args.do_shift,
         time_shifting_factor=args.time_shifting_factor,
+        guidance_scale=args.backbone_cfg,
+        guidance_scale_controlnet=args.controlnet_cfg,
     )
     sample, x_cond = samples[0], x_conds[0]
     img = to_pil_image(sample.float())
@@ -343,12 +337,12 @@ if __name__ == "__main__":
     parser.add_argument("--img_path", type=str, required=True)
     parser.add_argument("--height", type=int, default=1024)
     parser.add_argument("--width", type=int, default=1024)
-    parser.add_argument("--downsample_factor", type=int, default=1)
-    parser.add_argument("--denoising_strength", type=float, default=1.0)
+    parser.add_argument("--downsample_factor", type=int, default=1, help="Downsample factor for the conditioning image")
+    parser.add_argument("--denoising_strength", type=float, default=1.0, help="Start denoising strength, 1.0 means start from pure noise")
     parser.add_argument("--num_sampling_steps", type=int, default=50)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--ckpt", type=str, required=True)
-    parser.add_argument("--solver", type=str, default="euler")
+    parser.add_argument("--solver", type=str, default="euler", help="ODE solver method used for sampling")
     parser.add_argument(
         "--precision",
         type=str,
@@ -365,11 +359,14 @@ if __name__ == "__main__":
         "--time_shifting_factor",
         type=float,
         default=1.0,
+        help="Time shifting factor for diffusion schedule"
     )
-    parser.add_argument("--do_shift", default=True)
-    parser.add_argument("--double_gate", type=float, default=1.0)
-    parser.add_argument("--single_gate", type=float, default=1.0)
-    parser.add_argument("--img_embedder_path", type=str, default=None)
+    parser.add_argument("--do_shift", default=True, help="Whether to apply dynamic time shifting proposed in Flux")
+    parser.add_argument("--controlnet_cfg", type=float, default=1.0, help="Controlnet guidance scale")
+    parser.add_argument("--backbone_cfg", type=float, default=2.0, help="Backbone guidance scale")
+    parser.add_argument("--double_gate", type=float, default=1.0, help="Double block gate value for injecting controlnet features")
+    parser.add_argument("--single_gate", type=float, default=1.0, help="Single block gate value for injecting controlnet features")
+    parser.add_argument("--img_embedder_path", type=str, default=None, help="Path to the image embedder model")
     args = parser.parse_known_args()[0]
     
     main(args)

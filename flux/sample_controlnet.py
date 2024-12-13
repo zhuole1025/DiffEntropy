@@ -231,7 +231,7 @@ def main(args, rank, master_port):
                         img_cond=inp["img_cond"], 
                         img_mask=inp["img_mask"], 
                         img_cond_mask=inp["img_cond_mask"], 
-                        guidance=torch.full((x.shape[0],), 4.0, device=x.device, dtype=x.dtype), txt_cfg_scale=args.txt_cfg_scale, 
+                        guidance=torch.full((x.shape[0],), args.backbone_cfg, device=x.device, dtype=x.dtype), txt_cfg_scale=args.txt_cfg_scale, 
                         img_cfg_scale=args.img_cfg_scale,
                         double_gate=args.double_gate,
                         single_gate=args.single_gate
@@ -245,7 +245,8 @@ def main(args, rank, master_port):
                         y=inp["vec"],
                         txt_mask=inp["txt_mask"],
                         img_mask=inp["img_mask"],
-                        guidance=torch.full((x.shape[0],), 1.0, device=x.device, dtype=x.dtype),
+                        guidance=torch.full((x.shape[0],), args.controlnet_cfg, device=x.device, dtype=x.dtype),
+                        controlnet_snr=args.controlnet_snr,
                     )
 
                     samples = sample_fn(
@@ -386,6 +387,9 @@ if __name__ == "__main__":
         default=1e-3,
         help="Relative tolerance for the ODE solver.",
     )
+    parser.add_argument("--controlnet_cfg", type=float, default=1.0)
+    parser.add_argument("--backbone_cfg", type=float, default=4.0)
+    parser.add_argument("--controlnet_snr", type=float, default=None)
     parser.add_argument("--drop_cond", action="store_true")
     parser.add_argument("--resolution", type=str, default="1024:1024x1024")
     parser.add_argument("--do_shift", default=True)

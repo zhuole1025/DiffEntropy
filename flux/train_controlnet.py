@@ -17,6 +17,7 @@ from functools import partial
 import json
 import logging
 import os
+import math
 import random
 import socket
 from time import time
@@ -26,6 +27,7 @@ from safetensors.torch import load_file
 import wandb
 
 from PIL import Image
+import numpy as np
 import fairscale.nn.model_parallel.initialize as fs_init
 import torch
 import torch.distributed as dist
@@ -47,6 +49,10 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from diffusers import AutoencoderKL
+from basicsr.data.transforms import paired_random_crop
+from basicsr.utils import DiffJPEG, USMSharp
+from basicsr.utils.img_process_util import filter2D
+from basicsr.data.degradations import random_add_gaussian_noise_pt, random_add_poisson_noise_pt, circular_lowpass_kernel, random_mixed_kernels
 
 from data import ItemProcessor, MyDataset
 from flux.sampling import prepare
@@ -70,67 +76,241 @@ def invert_transform(x):
 
 
 class T2IItemProcessor(ItemProcessor):
-    def __init__(self, transform, transform_2=None):
-        self.image_transform = transform
-        self.image_transform_2 = transform_2
+    def __init__(self, high_res_list, high_res_probs, low_res_list, low_res_probs, downsample_factor=16):
+        # prepare hyper-parameters for resizing
+        if len(high_res_list) != 1:
+            raise ValueError("Currently only support single resolution for high-res images")
+        self.high_res_list = high_res_list
+        self.high_res_probs = high_res_probs
+        self.low_res_list = low_res_list
+        self.low_res_probs = low_res_probs
+        self.crop_size_dict = {}
+        for high_res in high_res_list:
+            scale = high_res // min(low_res_list)
+            max_num_tokens = round((high_res / downsample_factor) ** 2)
+            self.crop_size_dict[high_res] = generate_crop_size_list(max_num_tokens, downsample_factor, step_size=scale)
+        
+        # prepare hyper-parameters for degradation
+        self.sinc_prob = 0.1
+        self.kernel_list = ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso']
+        self.kernel_prob = [0.45, 0.25, 0.12, 0.03, 0.12, 0.03]
+        self.kernel_range = [2 * v + 1 for v in range(3, 11)]  # kernel size ranges from 7 to 21
+        self.blur_sigma = [0.2, 3]
+        self.betag_range = [0.5, 4]
+        self.betap_range = [1, 2]
+        
+        self.sinc_prob2 = 0.1
+        self.kernel_list2 = ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso']
+        self.kernel_prob2 = [0.45, 0.25, 0.12, 0.03, 0.12, 0.03]
+        self.blur_sigma2 = [0.2, 1.5]
+        self.betag_range2 = [0.5, 4]
+        self.betap_range2 = [1, 2]
+        
+        self.final_sinc_prob = 0.8
+        self.pulse_tensor = torch.zeros(21, 21).float()
+        self.pulse_tensor[10, 10] = 1.0
+        
+        self.resize_prob = [0.2, 0.7, 0.1] # up, down, keep
+        self.resize_range = [0.15, 1.5]
+        self.gaussian_noise_prob = 0.5
+        self.noise_range = [1, 30]
+        self.poisson_scale_range = [0.05, 3]
+        self.gray_noise_prob = 0.4
+        self.jpeg_range = [30, 95]
+        
+        self.second_blur_prob = 0.8
+        self.resize_prob2 = [0.3, 0.4, 0.3]
+        self.resize_range2 = [0.3, 1.2]
+        self.gaussian_noise_prob2 = 0.5
+        self.noise_range2 = [1, 25]
+        self.poisson_scale_range2 = [0.05, 2.5]
+        self.gray_noise_prob2 = 0.4
+        self.jpeg_range2 = [30, 95]
+        
+        self.jpeger = DiffJPEG(differentiable=False)  # simulate JPEG compression artifacts
+        self.usm_sharpener = USMSharp()  # do usm sharpening
+    
+    @torch.no_grad()
+    def get_condition(self, image, ds_factor):
+        image = self.usm_sharpener(image)
+        ori_h, ori_w = image.shape[-2], image.shape[-1]
+        
+        # ------------------------ Generate kernels (used in the first degradation) ------------------------ #
+        kernel_size = random.choice(self.kernel_range)
+        if np.random.uniform() < self.sinc_prob:
+            # this sinc filter setting is for kernels ranging from [7, 21]
+            if kernel_size < 13:
+                omega_c = np.random.uniform(np.pi / 3, np.pi)
+            else:
+                omega_c = np.random.uniform(np.pi / 5, np.pi)
+            kernel = circular_lowpass_kernel(omega_c, kernel_size, pad_to=False)
+        else:
+            kernel = random_mixed_kernels(
+                self.kernel_list,
+                self.kernel_prob,
+                kernel_size,
+                self.blur_sigma,
+                self.blur_sigma, [-math.pi, math.pi],
+                self.betag_range,
+                self.betap_range,
+                noise_range=None)
+        # pad kernel
+        pad_size = (21 - kernel_size) // 2
+        kernel = np.pad(kernel, ((pad_size, pad_size), (pad_size, pad_size)))
+
+        # ------------------------ Generate kernels (used in the second degradation) ------------------------ #
+        kernel_size = random.choice(self.kernel_range)
+        if np.random.uniform() < self.sinc_prob2:
+            if kernel_size < 13:
+                omega_c = np.random.uniform(np.pi / 3, np.pi)
+            else:
+                omega_c = np.random.uniform(np.pi / 5, np.pi)
+            kernel2 = circular_lowpass_kernel(omega_c, kernel_size, pad_to=False)
+        else:
+            kernel2 = random_mixed_kernels(
+                self.kernel_list2,
+                self.kernel_prob2,
+                kernel_size,
+                self.blur_sigma2,
+                self.blur_sigma2, [-math.pi, math.pi],
+                self.betag_range2,
+                self.betap_range2,
+                noise_range=None)
+
+        # pad kernel
+        pad_size = (21 - kernel_size) // 2
+        kernel2 = np.pad(kernel2, ((pad_size, pad_size), (pad_size, pad_size)))
+
+        # ------------------------------------- the final sinc kernel ------------------------------------- #
+        if np.random.uniform() < self.final_sinc_prob:
+            kernel_size = random.choice(self.kernel_range)
+            omega_c = np.random.uniform(np.pi / 3, np.pi)
+            sinc_kernel = circular_lowpass_kernel(omega_c, kernel_size, pad_to=21)
+            sinc_kernel = torch.FloatTensor(sinc_kernel)
+        else:
+            sinc_kernel = self.pulse_tensor
+
+        kernel1 = torch.FloatTensor(kernel).to(image.device)
+        kernel2 = torch.FloatTensor(kernel2).to(image.device)
+        sinc_kernel = sinc_kernel.to(image.device)
+        
+        # ----------------------- The first degradation process ----------------------- #
+        # blur
+        out = filter2D(image, kernel1)
+        # random resize
+        updown_type = random.choices(['up', 'down', 'keep'], self.resize_prob)[0]
+        if updown_type == 'up':
+            scale = np.random.uniform(1, self.resize_range[1])
+        elif updown_type == 'down':
+            scale = np.random.uniform(self.resize_range[0], 1)
+        else:
+            scale = 1
+        mode = random.choice(['area', 'bilinear', 'bicubic'])
+        out = F.interpolate(out, scale_factor=scale, mode=mode)
+        # add noise
+        gray_noise_prob = self.gray_noise_prob
+        if np.random.uniform() < self.gaussian_noise_prob:
+            out = random_add_gaussian_noise_pt(
+                out, sigma_range=self.noise_range, clip=True, rounds=False, gray_prob=gray_noise_prob)
+        else:
+            out = random_add_poisson_noise_pt(
+                out,
+                scale_range=self.poisson_scale_range,
+                gray_prob=gray_noise_prob,
+                clip=True,
+                rounds=False)
+        # JPEG compression
+        jpeg_p = out.new_zeros(out.size(0)).uniform_(*self.jpeg_range)
+        out = torch.clamp(out, 0, 1)  # clamp to [0, 1], otherwise JPEGer will result in unpleasant artifacts
+        out = self.jpeger(out, quality=jpeg_p)
+
+        # ----------------------- The second degradation process ----------------------- #
+        # blur
+        if np.random.uniform() < self.second_blur_prob:
+            out = filter2D(out, kernel2)
+        # random resize
+        updown_type = random.choices(['up', 'down', 'keep'], self.resize_prob2)[0]
+        if updown_type == 'up':
+            scale = np.random.uniform(1, self.resize_range2[1])
+        elif updown_type == 'down':
+            scale = np.random.uniform(self.resize_range2[0], 1)
+        else:
+            scale = 1
+        mode = random.choice(['area', 'bilinear', 'bicubic'])
+        out = F.interpolate(
+            out, size=(int(ori_h / ds_factor * scale), int(ori_w / ds_factor * scale)), mode=mode)
+        # add noise
+        gray_noise_prob = self.gray_noise_prob2
+        if np.random.uniform() < self.gaussian_noise_prob2:
+            out = random_add_gaussian_noise_pt(
+                out, sigma_range=self.noise_range2, clip=True, rounds=False, gray_prob=gray_noise_prob)
+        else:
+            out = random_add_poisson_noise_pt(
+                out,
+                scale_range=self.poisson_scale_range2,
+                gray_prob=gray_noise_prob,
+                clip=True,
+                rounds=False)
+
+        # JPEG compression + the final sinc filter
+        # We also need to resize images to desired sizes. We group [resize back + sinc filter] together
+        # as one operation.
+        # We consider two orders:
+        #   1. [resize back + sinc filter] + JPEG compression
+        #   2. JPEG compression + [resize back + sinc filter]
+        # Empirically, we find other combinations (sinc + JPEG + Resize) will introduce twisted lines.
+        if np.random.uniform() < 0.5:
+            # resize back + the final sinc filter
+            mode = random.choice(['area', 'bilinear', 'bicubic'])
+            out = F.interpolate(out, size=(ori_h // ds_factor, ori_w // ds_factor), mode=mode)
+            out = filter2D(out, sinc_kernel)
+            # JPEG compression
+            jpeg_p = out.new_zeros(out.size(0)).uniform_(*self.jpeg_range2)
+            out = torch.clamp(out, 0, 1)
+            out = self.jpeger(out, quality=jpeg_p)
+        else:
+            # JPEG compression
+            jpeg_p = out.new_zeros(out.size(0)).uniform_(*self.jpeg_range2)
+            out = torch.clamp(out, 0, 1)
+            out = self.jpeger(out, quality=jpeg_p)
+            # resize back + the final sinc filter
+            mode = random.choice(['area', 'bilinear', 'bicubic'])
+            out = F.interpolate(out, size=(ori_h // ds_factor, ori_w // ds_factor), mode=mode)
+            out = filter2D(out, sinc_kernel)
+
+        # clamp and round
+        cond_image = torch.clamp((out * 255.0).round(), 0, 255) / 255.
+        cond_image = cond_image.contiguous()
+        
+        return image, cond_image
 
     def process_item(self, data_item, training_mode=False):
         text_emb = None
-        if "conversations" in data_item:
-            assert "image" in data_item and len(data_item["conversations"]) == 2
-            image = Image.open(read_general(data_item["image"])).convert("RGB")
-            text = data_item["conversations"][1]["value"]
-        elif "path" in data_item:
+        if "path" in data_item:
             image_path = data_item["path"]
             image = Image.open(image_path).convert("RGB")
             text = data_item["gpt_4_caption"]
             # if "text_embeddings_path" in data_item:
                 # text_emb = load_file(data_item["text_embeddings_path"], device="cpu")
-        elif "image_url" in data_item:
-            url = data_item["image_url"]
-            url = url.replace(
-                "/mnt/petrelfs/share_data/gaopeng/image_text_data",
-                "/mnt/hwfile/alpha_vl/gaopeng/share_data/image_text_data",
-            )
-            url = url.replace("/mnt/petrelfs/share_data/huxiangfei", "/mnt/hwfile/alpha_vl/huxiangfei")
-            image = Image.open(read_general(url)).convert("RGB")
-            caption_keys = [
-                "sharegpt4v_long_cap",
-                "cogvlm_long",
-                "blip2_short_cap",
-                "llava13b_long_cap",
-                "spatial_caption",
-                "coca_caption",
-                "user_prompt",
-                "tags_prompt",
-                "gpt4v_concise_elements",
-                "gpt4v_regions_detailed_description",
-                "gpt4v_detailed_description",
-                "gpt4v_concise_description",
-                'cogvlm_long_user_prompt_conditioned',
-                'internvl_V1.5_user_prompt_conditioned',
-                'cogvlm2_long_user_prompt_conditioned',
-                'florence2_cap',
-            ]
-            candidate_caps = [data_item[x] for x in caption_keys if x in data_item and data_item[x]]
-            text = random.choice(candidate_caps) if len(candidate_caps) else ""
-        elif "image" in data_item and "caption" in data_item:
-            image = Image.open(read_general(data_item["image"].replace("hzh:s3://", "cluster_s_hdd_gp:s3://"))).convert(
-                "RGB"
-            )
-            text = data_item["caption"]
         else:
             raise ValueError(f"Unrecognized item: {data_item}")
-
-        if self.image_transform_2 is not None:
-            if random.random() < 0.5:
-                image = self.image_transform(image)
-            else:
-                image = self.image_transform_2(image)
+        
+        if random.random() < 0.5:
+            is_tiled = True
         else:
-            image = self.image_transform(image)
+            is_tiled = False
+        
+        high_res = random.choices(self.high_res_list, self.high_res_probs)[0]
+        low_res = random.choices(self.low_res_list, self.low_res_probs)[0]
+        ds_factor = high_res // low_res
+        image = to_rgb_if_rgba(image)
+        image = var_center_crop(image, crop_size_list=self.crop_size_dict[high_res], random_top_k=1, is_tiled=is_tiled)
+        image = transforms.ToTensor()(image)
+        image, cond_image = self.get_condition(image[None, ...], ds_factor)
+        image = transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])(image)
+        cond_image = transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])(cond_image)
 
-        return image, text, text_emb
+        return image, cond_image, text, text_emb
 
 
 #############################################################################
@@ -140,11 +320,12 @@ class T2IItemProcessor(ItemProcessor):
 
 def dataloader_collate_fn(samples):
     image = [x[0] for x in samples]
-    caps = [x[1] for x in samples]
-    text_emb = [x[2] for x in samples]
+    cond_image = [x[1] for x in samples]
+    caps = [x[2] for x in samples]
+    text_emb = [x[3] for x in samples]
     if all(x is None for x in text_emb):
         text_emb = None
-    return image, caps, text_emb
+    return image, cond_image, caps, text_emb
 
 
 def get_train_sampler(dataset, rank, world_size, global_batch_size, max_steps, resume_step, seed):
@@ -567,7 +748,6 @@ def main(args):
 
     # Setup data:
     logger.info(f"Creating data")
-    data_collection = {}
     global_bsz = args.global_bsz
     local_bsz = global_bsz // dp_world_size  # todo caution for sequence parallel
     micro_bsz = args.micro_bsz
@@ -576,107 +756,64 @@ def main(args):
     logger.info(f"Global bsz: {global_bsz} Local bsz: {local_bsz} Micro bsz: {micro_bsz}")
     patch_size = 16
     logger.info(f"patch size: {patch_size}")
-    for train_res in args.high_res_list:
-        scale_factor = train_res // min(args.low_res_list)
-        max_num_patches = round((train_res / patch_size) ** 2) // scale_factor * scale_factor
-        crop_size_list = generate_crop_size_list(max_num_patches, patch_size, step_size=scale_factor)
-        logger.info("List of crop sizes:")
-        for i in range(0, len(crop_size_list), 6):
-            logger.info(" " + "".join([f"{f'{w} x {h}':14s}" for w, h in crop_size_list[i : i + 6]]))
-        image_transform = transforms.Compose(
-            [
-                transforms.Lambda(lambda img: to_rgb_if_rgba(img)),
-                transforms.Lambda(functools.partial(var_center_crop, crop_size_list=crop_size_list, random_top_k=1)),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
-            ]
-        )
-        image_transform_2 = transforms.Compose(
-            [
-                transforms.Lambda(lambda img: to_rgb_if_rgba(img)),
-                transforms.Lambda(functools.partial(var_center_crop, crop_size_list=crop_size_list, random_top_k=1, is_tiled=True)),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
-            ]
-        )
-        dataset = MyDataset(
-            args.data_path,
-            train_res=train_res if not args.debug else None,
-            item_processor=T2IItemProcessor(image_transform, image_transform_2),
-            cache_on_disk=args.cache_data_on_disk,
-        )
-        logger.info(f"Dataset for {train_res} contains {len(dataset):,} images ({args.data_path})")
-        logger.info(f"Total # samples to consume: {num_samples:,} " f"({num_samples / len(dataset):.2f} epochs)")
-        sampler = get_train_sampler(
-            dataset,
-            dp_rank,
-            dp_world_size,
-            global_bsz,
-            args.max_steps,
-            resume_step,
-            args.global_seed
-        )
-        loader = DataLoader(
-            dataset,
-            batch_size=local_bsz,
-            sampler=sampler,
-            num_workers=args.num_workers,
-            pin_memory=True,
-            collate_fn=dataloader_collate_fn,
-            # prefetch_factor=3,
-        )
+    dataset = MyDataset(
+        args.data_path,
+        train_res=None,
+        item_processor=T2IItemProcessor(args.high_res_list, args.high_res_probs, args.low_res_list, args.low_res_probs),
+        cache_on_disk=args.cache_data_on_disk,
+    )
+    logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
+    logger.info(f"Total # samples to consume: {num_samples:,} " f"({num_samples / len(dataset):.2f} epochs)")
+    sampler = get_train_sampler(
+        dataset,
+        dp_rank,
+        dp_world_size,
+        global_bsz,
+        args.max_steps,
+        resume_step,
+        args.global_seed
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=local_bsz,
+        sampler=sampler,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        collate_fn=dataloader_collate_fn,
+        # prefetch_factor=3,
+    )
 
-        data_collection[train_res] = {
-            "loader": loader,
-            "loader_iter": iter(loader),
-            "global_bsz": global_bsz,
-            "local_bsz": local_bsz,
-            "micro_bsz": micro_bsz,
-            "metrics": defaultdict(lambda: SmoothedValue(args.log_every)),
-            "transport": transport,
-        }
+    data_pack = {
+        "loader": loader,
+        "loader_iter": iter(loader),
+        "global_bsz": global_bsz,
+        "local_bsz": local_bsz,
+        "micro_bsz": micro_bsz,
+        "metrics": defaultdict(lambda: SmoothedValue(args.log_every)),
+        "transport": transport,
+    }
 
     # Prepare models for training:
     model.train()
 
     # Variables for monitoring/logging purposes:
     logger.info(f"Training for {args.max_steps:,} steps...")
-
     start_time = time()
     for step in range(resume_step, args.max_steps):
-        high_res = random.choices(args.high_res_list, weights=args.high_res_probs)[0]
-        low_res = random.choices(args.low_res_list, weights=args.low_res_probs)[0]
-        high_res = torch.tensor(high_res, device=device)
-        low_res = torch.tensor(low_res, device=device)
-        torch.distributed.broadcast(high_res, src=0)
-        torch.distributed.broadcast(low_res, src=0)
-        high_res = high_res.item()
-        low_res = low_res.item()
-        ds_factor = high_res // low_res
-        data_pack = data_collection[high_res]
-        
-        x, caps, text_emb = next(data_pack["loader_iter"])
+        x, x_cond, caps, text_emb = next(data_pack["loader_iter"])
         x = [img.to(device, non_blocking=True) for img in x]
-        
+        x_cond = [img.to(device, non_blocking=True) for img in x_cond]
         with torch.no_grad():
-            # Map input images to latent space + normalize latents:
-            # x_cond = [F.interpolate(img[None], size=(img.shape[-2] // ds_factor, img.shape[-1] // ds_factor), mode="bilinear", align_corners=False)[0] for img in x]
-            x_cond = [
-                F.interpolate(
-                    F.interpolate(img[None], size=(img.shape[-2] // ds_factor, img.shape[-1] // ds_factor), mode="bilinear", align_corners=False), 
-                    size=(img.shape[-2], img.shape[-1]), 
-                    mode="bilinear", align_corners=False
-                )[0] for img in x
-            ]
             if img_embedder is not None:
-                raw_x_cond = [invert_transform(img) for img in x_cond]
+                raw_x_cond = [invert_transform(img.squeeze(0)) for img in x_cond]
             else:
                 raw_x_cond = None
-            x_cond = [(ae.encode(img[None].to(ae.dtype)).latent_dist.sample()[0] - ae.config.shift_factor) * ae.config.scaling_factor for img in x_cond]
-            if high_res > 3072:
-                x = [(ae.tiled_encode(img[None].to(ae.dtype)).latent_dist.sample()[0] - ae.config.shift_factor) * ae.config.scaling_factor for img in x]
+            x_cond = [F.interpolate(x_cond[i], size=(x[i].shape[-2], x[i].shape[-1]), mode="bilinear", align_corners=False) for i in range(len(x_cond))]
+            x_cond = [(ae.encode(img.to(ae.dtype)).latent_dist.sample()[0] - ae.config.shift_factor) * ae.config.scaling_factor for img in x_cond]
+            if False:
+                x = [(ae.tiled_encode(img.to(ae.dtype)).latent_dist.sample()[0] - ae.config.shift_factor) * ae.config.scaling_factor for img in x]
             else:
-                x = [(ae.encode(img[None].to(ae.dtype)).latent_dist.sample()[0] - ae.config.shift_factor) * ae.config.scaling_factor for img in x]
+                x = [(ae.encode(img.to(ae.dtype)).latent_dist.sample()[0] - ae.config.shift_factor) * ae.config.scaling_factor for img in x]
             
         with torch.no_grad():
             inp = prepare(t5=t5, clip=clip, img=x, img_cond=x_cond, prompt=caps, proportion_empty_prompts=args.caption_dropout_prob, proportion_empty_images=args.image_dropout_prob, text_emb=text_emb, img_embedder=img_embedder, raw_img_cond=raw_x_cond)
@@ -699,7 +836,6 @@ def main(args):
             last_mb = mb_ed == data_pack["local_bsz"]
 
             x_mb = inp["img"][mb_st:mb_ed]
-            
             model_kwargs = dict(
                 img_ids=inp["img_ids"][mb_st:mb_ed],
                 txt=inp["txt"][mb_st:mb_ed],
@@ -707,7 +843,7 @@ def main(args):
                 txt_mask=inp["txt_mask"][mb_st:mb_ed],
                 y=inp["vec"][mb_st:mb_ed],
                 img_mask=inp["img_mask"][mb_st:mb_ed],
-                guidance=torch.full((x_mb.shape[0],), 1.0, device=x_mb.device, dtype=x_mb.dtype),
+                guidance=torch.full((x_mb.shape[0],), args.backbone_cfg, device=x_mb.device, dtype=x_mb.dtype),
             )
             
             controlnet_kwargs = dict(
@@ -718,7 +854,7 @@ def main(args):
                 y=inp["vec"][mb_st:mb_ed],
                 txt_mask=inp["txt_mask"][mb_st:mb_ed],
                 img_mask=inp["img_mask"][mb_st:mb_ed],
-                guidance=torch.full((x_mb.shape[0],), 1.0, device=x_mb.device, dtype=x_mb.dtype),
+                guidance=torch.full((x_mb.shape[0],), args.controlnet_cfg, device=x_mb.device, dtype=x_mb.dtype),
                 controlnet_snr=args.controlnet_snr,
             )
             
@@ -796,7 +932,7 @@ def main(args):
             # Measure training speed:
             torch.cuda.synchronize()
             logger.info(
-                f"Res{train_res}: (step{step + 1:07d}) "
+                f"(step{step + 1:07d}) "
                 + f"lr{opt.param_groups[0]['lr']:.6f} "
                 + " ".join([f"{key}:{str(metrics[key])}" for key in sorted(metrics.keys())])
             )
@@ -992,6 +1128,8 @@ if __name__ == "__main__":
         default="0.2,0.7,0.1",
         help="Comma-separated list of probabilities for sampling low resolution images."
     )
+    parser.add_argument("--backbone_cfg", type=float, default=1.0)
+    parser.add_argument("--controlnet_cfg", type=float, default=1.0)
     parser.add_argument("--compute_controlnet_loss", action="store_true")
     parser.add_argument("--controlnet_snr", type=str, default=None)
     parser.add_argument("--img_embedder_path", type=str, default=None)

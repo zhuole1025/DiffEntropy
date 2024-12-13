@@ -130,6 +130,7 @@ def prepare(t5: HFEmbedder, clip: HFEmbedder, img: Tensor, img_cond: Tensor, pro
         if not is_training:
             txt = torch.cat([txt, global_img_cond], dim=1) # prompt + image
             # txt = txt
+            # txt = global_img_cond
         elif random.random() < 0.3:
             txt = torch.cat([txt, global_img_cond], dim=1) # prompt + image
         elif random.random() < 0.6:

@@ -110,10 +110,14 @@ class ode:
         def _fn(t, x):
             t = th.ones(x[0].size(0)).to(device) * t if isinstance(x, tuple) else th.ones(x.size(0)).to(device) * t
             if controlnet is not None:
-                t_cond = th.ones(x_cond.size(0)).to(device) * 0.5
-                noise = th.randn_like(x_cond)
-                xt_cond = x_cond * t_cond.view(-1, 1, 1) + noise * (1 - t_cond).view(-1, 1, 1)
-                controlnet_out_dict = controlnet(xt_cond, timesteps=1 - t_cond, bb_timesteps=1 - t, **controlnet_kwargs)
+                controlnet_snr = controlnet_kwargs.pop("controlnet_snr", None)
+                if controlnet_snr is not None:
+                    t_cond = th.ones(x_cond.size(0)).to(device) * controlnet_snr
+                    noise = th.randn_like(x_cond)
+                    xt_cond = x_cond * t_cond.view(-1, 1, 1) + noise * (1 - t_cond).view(-1, 1, 1)
+                    controlnet_out_dict = controlnet(xt_cond, timesteps=1 - t_cond, bb_timesteps=1 - t, **controlnet_kwargs)
+                else:
+                    controlnet_out_dict = controlnet(x_cond, timesteps=None, bb_timesteps=1 - t, **controlnet_kwargs)
                 model_kwargs["double_controls"] = controlnet_out_dict["double_block_feats"]
                 model_kwargs["single_controls"] = controlnet_out_dict["single_block_feats"]
             model_output = self.drift(x, t, model, **model_kwargs)
