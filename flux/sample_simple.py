@@ -1,4 +1,5 @@
 import argparse
+from functools import cache
 import functools
 import json
 import os
@@ -230,13 +231,10 @@ def generate_samples(
     return samples, x_cond
 
 
-def main(args, rank=0):
-    # Setup PyTorch:
-    torch.set_grad_enabled(False)
-
-    torch.cuda.set_device(rank)
+@cache
+def load_models(ckpt, precision, img_embedder_path, rank=0):
     device_str = f"cuda:{rank}"
-    dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[args.precision]
+    dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
 
     print("Init controlnet")
     params = configs["flux-dev"].params
@@ -263,8 +261,8 @@ def main(args, rank=0):
     t5 = load_t5(device_str, max_length=512)
     clip = load_clip(device_str)
     
-    if args.img_embedder_path is not None:
-        img_embedder = ReduxImageEncoder(device=device_str, redux_path=args.img_embedder_path)
+    if img_embedder_path is not None:
+        img_embedder = ReduxImageEncoder(device=device_str, redux_path=img_embedder_path)
         img_embedder.requires_grad_(False)
         print(f"Image embedder loaded")
     else:
@@ -272,7 +270,7 @@ def main(args, rank=0):
         
     ckpt = torch.load(
         os.path.join(
-            args.ckpt,
+            ckpt,
             f"consolidated.00-of-01.pth",
         )
     )
@@ -280,11 +278,19 @@ def main(args, rank=0):
         
     ckpt = torch.load(
         os.path.join(
-            args.ckpt,
+            ckpt,
             f"consolidated_controlnet.00-of-01.pth",
         )
     )
     controlnet.load_state_dict(ckpt, strict=True)
+    return controlnet, model, ae, t5, clip, img_embedder
+
+def main(args, rank=0):
+    # Setup PyTorch:
+    torch.set_grad_enabled(False)
+
+    torch.cuda.set_device(rank)
+    controlnet, model, ae, t5, clip, img_embedder = load_models(args.ckpt, args.precision, args.img_embedder_path, rank)
         
     sample_folder_dir = args.image_save_path
     os.makedirs(sample_folder_dir, exist_ok=True)
@@ -331,7 +337,7 @@ def main(args, rank=0):
     low_img.save(low_save_path, format='JPEG', quality=95)
                         
                         
-if __name__ == "__main__":
+def get_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--prompt", type=str, required=True)
     parser.add_argument("--img_path", type=str, required=True)
@@ -367,6 +373,10 @@ if __name__ == "__main__":
     parser.add_argument("--double_gate", type=float, default=1.0, help="Double block gate value for injecting controlnet features")
     parser.add_argument("--single_gate", type=float, default=1.0, help="Single block gate value for injecting controlnet features")
     parser.add_argument("--img_embedder_path", type=str, default=None, help="Path to the image embedder model")
+    return parser
+
+if __name__ == "__main__":
+    parser = get_parser()
     args = parser.parse_known_args()[0]
     
     main(args)
