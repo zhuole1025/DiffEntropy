@@ -232,7 +232,7 @@ def generate_samples(
 
 
 @cache
-def load_models(ckpt, precision, img_embedder_path, rank=0):
+def load_models(ckpt_folder, precision, img_embedder_path, rank=0):
     device_str = f"cuda:{rank}"
     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
 
@@ -261,16 +261,9 @@ def load_models(ckpt, precision, img_embedder_path, rank=0):
     t5 = load_t5(device_str, max_length=512)
     clip = load_clip(device_str)
     
-    if img_embedder_path is not None:
-        img_embedder = ReduxImageEncoder(device=device_str, redux_path=img_embedder_path)
-        img_embedder.requires_grad_(False)
-        print(f"Image embedder loaded")
-    else:
-        img_embedder = None
-        
     ckpt = torch.load(
         os.path.join(
-            ckpt,
+            ckpt_folder,
             f"consolidated.00-of-01.pth",
         )
     )
@@ -278,19 +271,31 @@ def load_models(ckpt, precision, img_embedder_path, rank=0):
         
     ckpt = torch.load(
         os.path.join(
-            ckpt,
+            ckpt_folder,
             f"consolidated_controlnet.00-of-01.pth",
         )
     )
     controlnet.load_state_dict(ckpt, strict=True)
-    return controlnet, model, ae, t5, clip, img_embedder
+    return controlnet, model, ae, t5, clip
+
+@cache
+def load_image_embedder(img_embedder_path, rank=0):
+    device_str = f"cuda:{rank}"
+    if img_embedder_path is not None:
+        img_embedder = ReduxImageEncoder(device=device_str, redux_path=img_embedder_path)
+        img_embedder.requires_grad_(False)
+        print(f"Image embedder loaded")
+        return img_embedder
+    return None
+        
 
 def main(args, rank=0):
     # Setup PyTorch:
     torch.set_grad_enabled(False)
 
     torch.cuda.set_device(rank)
-    controlnet, model, ae, t5, clip, img_embedder = load_models(args.ckpt, args.precision, args.img_embedder_path, rank)
+    controlnet, model, ae, t5, clip = load_models(args.ckpt, args.precision, rank)
+    img_embedder = load_image_embedder(args.img_embedder_path, rank)
         
     sample_folder_dir = args.image_save_path
     os.makedirs(sample_folder_dir, exist_ok=True)
@@ -335,6 +340,7 @@ def main(args, rank=0):
     low_img = to_pil_image(x_cond.float())
     low_save_path = f"{args.image_save_path}/{args.solver}_{args.num_sampling_steps}_{args.denoising_strength}_low.jpg"
     low_img.save(low_save_path, format='JPEG', quality=95)
+    return img
                         
                         
 def get_parser():

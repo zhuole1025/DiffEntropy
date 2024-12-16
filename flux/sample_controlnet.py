@@ -77,6 +77,7 @@ def main(args, rank, master_port):
     params.attn_token_select = args.attn_token_select
     params.mlp_token_select = args.mlp_token_select
     params.zero_init = train_args.zero_init
+    params.learnable_gate = args.learnable_gate
     with torch.device(device_str):
         model = Flux(params).to(dtype)
         
@@ -387,6 +388,7 @@ if __name__ == "__main__":
         default=1e-3,
         help="Relative tolerance for the ODE solver.",
     )
+    parser.add_argument("--learnable_gate", action="store_true")
     parser.add_argument("--controlnet_cfg", type=float, default=1.0)
     parser.add_argument("--backbone_cfg", type=float, default=4.0)
     parser.add_argument("--controlnet_snr", type=float, default=None)

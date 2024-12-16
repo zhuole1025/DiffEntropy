@@ -132,7 +132,7 @@ class T2IItemProcessor(ItemProcessor):
     
     @torch.no_grad()
     def get_condition(self, image, ds_factor):
-        image = self.usm_sharpener(image)
+        # image = self.usm_sharpener(image)
         ori_h, ori_w = image.shape[-2], image.shape[-1]
         
         # ------------------------ Generate kernels (used in the first degradation) ------------------------ #
@@ -535,7 +535,7 @@ def main(args):
     else:
         img_embedder = None
     
-    model = load_flow_model("flux-dev", device=device_str, dtype=torch.bfloat16, attn_token_select=args.attn_token_select, mlp_token_select=args.mlp_token_select, zero_init=args.zero_init)
+    model = load_flow_model("flux-dev", device=device_str, dtype=torch.bfloat16, attn_token_select=args.attn_token_select, mlp_token_select=args.mlp_token_select, zero_init=args.zero_init, learnable_gate=args.learnable_gate)
     # for block in model.double_blocks:
         # block.init_cond_weights()
     model_params = []
@@ -547,15 +547,18 @@ def main(args):
         # elif 'norm' in name or 'bias' in name:
             # param.requires_grad = True
             # model_params.append(param)
-        elif 'controlnet_gates' in name:
+        elif 'gate' in name:
             param.requires_grad = True
             controlnet_params.append(param)
         else:
             param.requires_grad = False
     
     controlnet = load_controlnet("flux-dev", device=device_str, dtype=torch.bfloat16, transformer=model, double_depth=args.double_depth, single_depth=args.single_depth, backbone_depth=args.backbone_depth, backbone_depth_single=args.backbone_depth_single, compute_loss=args.compute_controlnet_loss)
-    controlnet.train()
-    controlnet_params = controlnet_params + [p for p in controlnet.parameters() if p.requires_grad]
+    if args.learnable_gate:
+        controlnet.requires_grad_(False)
+    else:
+        controlnet.train()
+        controlnet_params = controlnet_params + [p for p in controlnet.parameters() if p.requires_grad]
     
     total_params = model.parameter_count()
     size_in_gb = total_params * 4 / 1e9
@@ -618,25 +621,9 @@ def main(args):
                 ),
                 map_location="cpu",
             )
-
-            size_mismatch_keys = []
-            model_state_dict = model.state_dict()
-            for k, v in state_dict.items():
-                if k in model_state_dict and model_state_dict[k].shape != v.shape:
-                    size_mismatch_keys.append(k)
-            for k in size_mismatch_keys:
-                del state_dict[k]
-            del model_state_dict
-
-            missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-            missing_keys_ema, unexpected_keys_ema = model_ema.load_state_dict(state_dict, strict=False)
+            model.load_state_dict(state_dict, strict=False)
+            model_ema.load_state_dict(state_dict, strict=False)
             del state_dict
-            assert set(missing_keys) == set(missing_keys_ema)
-            assert set(unexpected_keys) == set(unexpected_keys_ema)
-            logger.info("Model initialization result:")
-            logger.info(f"  Size mismatch keys: {size_mismatch_keys}")
-            logger.info(f"  Missing keys: {missing_keys}")
-            logger.info(f"  Unexpeected keys: {unexpected_keys}")
             
             controlnet.load_state_dict(
                 torch.load(
@@ -1128,6 +1115,7 @@ if __name__ == "__main__":
         default="0.2,0.7,0.1",
         help="Comma-separated list of probabilities for sampling low resolution images."
     )
+    parser.add_argument("--learnable_gate", action="store_true")
     parser.add_argument("--backbone_cfg", type=float, default=1.0)
     parser.add_argument("--controlnet_cfg", type=float, default=1.0)
     parser.add_argument("--compute_controlnet_loss", action="store_true")

@@ -532,9 +532,12 @@ class ControlNetGate(nn.Module):
         #     nn.Linear(hidden_size, hidden_size // 2)
         # )
         # self.linear_y = nn.Linear(hidden_size, hidden_size // 2)
-        self.linear_out = nn.Sequential(
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True))
+        self.linear_in = nn.Sequential(
             nn.Linear(hidden_size * 2, hidden_size),
             nn.SiLU(),
+        )
+        self.linear_out = nn.Sequential(
             nn.Linear(hidden_size, hidden_size // 2),
             nn.SiLU(),
             nn.Linear(hidden_size // 2, 1)
@@ -542,8 +545,8 @@ class ControlNetGate(nn.Module):
         nn.init.zeros_(self.linear_out[-1].weight)
         nn.init.zeros_(self.linear_out[-1].bias)
         
-    def forward(self, x: Tensor, y: Tensor) -> Tensor:
-        # x = self.linear_x(x)
-        # y = self.linear_y(y)
-        # return self.linear_out(torch.cat((x, y.unsqueeze(1).expand(-1, x.shape[1], -1)), dim=-1))
+    def forward(self, x: Tensor, y: Tensor, vec: Tensor) -> Tensor:
+        x = self.linear_in(torch.cat((x, y), dim=-1))
+        shift, scale = self.adaLN_modulation(vec).chunk(2, dim=1)
+        x = (1 + scale[:, None, :]) * x + shift[:, None, :]
         return self.linear_out(x)

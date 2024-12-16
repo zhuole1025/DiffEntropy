@@ -77,12 +77,20 @@ class Flux(nn.Module):
 
         self.final_layer = LastLayer(self.hidden_size, 1, self.out_channels)
         
-        # self.controlnet_gates = nn.ModuleList(
-        #     [
-        #         ControlNetGate(self.hidden_size)
-        #         for _ in range(params.depth)
-        #     ]   
-        # )
+        self.learnable_gate = params.learnable_gate
+        if self.learnable_gate:
+            self.double_controlnet_gates = nn.ModuleList(
+                [
+                    ControlNetGate(self.hidden_size)
+                    for _ in range(params.depth)
+                ]   
+            )
+            self.single_controlnet_gates = nn.ModuleList(
+                [
+                    ControlNetGate(self.hidden_size)
+                    for _ in range(params.depth_single_blocks)
+                ]   
+            )
         
         # self.img_cond_in = nn.Linear(self.in_channels, self.hidden_size, bias=True)
         # nn.init.zeros_(self.img_cond_in.weight)
@@ -137,7 +145,12 @@ class Flux(nn.Module):
             if double_controls is not None:
                 # gate = torch.tanh(self.controlnet_gates[idx](torch.cat((img, img + controls[idx % len(controls)]), dim=-1), vec))
                 # print(timesteps[0].item(), idx, gate.abs().mean().item(), gate.abs().var().item(), (controls[idx % len(controls)] * gate).mean().item(), img.mean().item())
-                img = img + double_controls[idx % len(double_controls)] * double_gate
+                if self.learnable_gate:
+                    gate = torch.tanh(self.double_controlnet_gates[idx](img, double_controls[idx % len(double_controls)], vec))
+                    img = img + double_controls[idx % len(double_controls)] * gate
+                    print("double: ", timesteps[0].item(), idx, gate.abs().mean().item(), gate.abs().var().item())
+                else:
+                    img = img + double_controls[idx % len(double_controls)] * double_gate
                 # gate_logits_list.append(gate)
         
         # pe = pe[:, :, img_cond_ids.shape[1]:, ...]
@@ -150,7 +163,12 @@ class Flux(nn.Module):
                 token_logits_list.append(token_logits)
             
             if single_controls is not None:
-                img = img + single_controls[idx % len(single_controls)] * single_gate
+                if self.learnable_gate:
+                    gate = torch.tanh(self.single_controlnet_gates[idx](img, single_controls[idx % len(single_controls)], vec))
+                    img = img + single_controls[idx % len(single_controls)] * gate
+                    print("single: ", timesteps[0].item(), idx, gate.abs().mean().item(), gate.abs().var().item())
+                else:
+                    img = img + single_controls[idx % len(single_controls)] * single_gate
                 
         # if img_cond is not None:
             # img = img[:, img_cond.shape[1] :, ...]
