@@ -156,9 +156,17 @@ def main(args, rank, master_port):
         info = []
         collected_id = []
 
-    with open(args.caption_path, "r", encoding="utf-8") as file:
-        data = json.load(file)
     
+    if (args.data_path).endswith(".json"):
+        with open(args.data_path, "r", encoding="utf-8") as file:
+            data = json.load(file)
+    else:
+        files = os.listdir(args.data_path)
+        data = []
+        for file in files:
+            if file.endswith(".jpg") or file.endswith(".png"):
+                data.append(os.path.join(args.data_path, file))
+                
     crop_size_dict = {}
     patch_size = 16
     for low_res in args.low_res_list:
@@ -168,8 +176,14 @@ def main(args, rank, master_port):
     total = len(info)
     with torch.autocast("cuda", dtype):
         for idx, item in tqdm(enumerate(data)):
-            caps_list = [item["gpt_4_caption"]]
-            image = Image.open(os.path.join(args.root_path, item["path"]))
+            if isinstance(item, dict):
+                caps_list = [item["gpt_4_caption"]]
+                path = item["path"]
+            else:
+                caps_list = [""]
+                path = item
+            path = os.path.join(args.root_path, path) if args.root_path is not None else path
+            image = Image.open(path)
             image = image.convert("RGB")
             
             for high_res in args.high_res_list:
@@ -211,11 +225,10 @@ def main(args, rank, master_port):
                     
                     low_h, low_w = x_cond.shape[-2:]
                     h, w = low_h * up_scale, low_w * up_scale
-                    n = len(caps_list)
                     x = torch.randn([1, 16, h, w], device=device_str).to(dtype)
-                    # x = x.repeat(n * 3, 1, 1, 1)
+                    # x = x.repeat(3, 1, 1, 1)
                     with torch.no_grad():
-                        inp = prepare(t5=t5, clip=clip, img=x, img_cond=x_cond, prompt=[caps_list], proportion_empty_prompts=0.0, proportion_empty_images=0.0, raw_img_cond=raw_x_cond, img_embedder=img_embedder, is_training=False)
+                        inp = prepare(t5=t5, clip=clip, img=x, img_cond=x_cond, prompt=[caps_list], proportion_empty_prompts=args.proportion_empty_prompts, proportion_empty_images=args.proportion_empty_images, raw_img_cond=raw_x_cond, img_embedder=img_embedder, is_training=False, cond_type=args.cond_type)
                     
                     if args.drop_cond:
                         inp["img_cond"] = None
@@ -344,7 +357,7 @@ if __name__ == "__main__":
         default=1.0,
     )
     parser.add_argument(
-        "--caption_path",
+        "--data_path",
         type=str,
         default="prompts.txt",
     )
@@ -388,6 +401,9 @@ if __name__ == "__main__":
         default=1e-3,
         help="Relative tolerance for the ODE solver.",
     )
+    parser.add_argument("--cond_type", type=str, default="text+image")
+    parser.add_argument("--proportion_empty_prompts", type=float, default=0.0)
+    parser.add_argument("--proportion_empty_images", type=float, default=0.0)
     parser.add_argument("--learnable_gate", action="store_true")
     parser.add_argument("--controlnet_cfg", type=float, default=1.0)
     parser.add_argument("--backbone_cfg", type=float, default=4.0)
@@ -402,7 +418,7 @@ if __name__ == "__main__":
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--max_length", type=int, default=512, help="Max length for T5.")
-    parser.add_argument("--root_path", type=str, default="")
+    parser.add_argument("--root_path", type=str, default=None)
     parser.add_argument("--double_depth", type=int, default=2)
     parser.add_argument("--single_depth", type=int, default=0)
     parser.add_argument("--backbone_depth", type=int, default=19)

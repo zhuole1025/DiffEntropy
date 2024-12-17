@@ -72,7 +72,7 @@ class ReduxImageEncoder(nn.Module):
         redux_dim: int = 1152,
         txt_in_features: int = 4096,
         redux_path: str | None = os.getenv("FLUX_REDUX"),
-        dtype=torch.float16,
+        dtype=torch.bfloat16,
     ) -> None:
         assert redux_path is not None, "Redux path must be provided"
 
@@ -90,7 +90,7 @@ class ReduxImageEncoder(nn.Module):
             missing, unexpected = self.load_state_dict(sd, strict=False, assign=True)
             print_load_warning(missing, unexpected)
 
-            self.siglip = SiglipVisionModel.from_pretrained(self.siglip_model_name, attn_implementation="flash_attention_2").to(dtype=dtype)
+            self.siglip = SiglipVisionModel.from_pretrained(self.siglip_model_name).to(dtype=dtype)
         self.normalize = SiglipImageProcessor.from_pretrained(self.siglip_model_name)
 
     def __call__(self, x: Image.Image) -> torch.Tensor:

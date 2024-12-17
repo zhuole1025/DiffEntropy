@@ -62,6 +62,8 @@ def var_center_crop(pil_image, crop_size_list, random_top_k=4, is_tiled=False):
         crop_size = random.choice(
             sorted(((x, y) for x, y in zip(rem_percent, crop_size_list)), reverse=True)[:random_top_k]
         )[1]
+    if pil_image.size == crop_size:
+        return pil_image
     return center_crop(pil_image, crop_size, is_tiled)
 
 
