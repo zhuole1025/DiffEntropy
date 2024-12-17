@@ -9,6 +9,12 @@ import torch.nn.functional as F
 from flux.math import attention, rope
 
 
+def zero_module(module):
+    for p in module.parameters():
+        nn.init.zeros_(p)
+    return module
+
+
 def _gumbel_sigmoid(
     logits, tau=1, hard=False, eps=1e-10, training=True, threshold=0.5
 ):

@@ -156,7 +156,7 @@ class Flux(nn.Module):
         # pe = pe[:, :, img_cond_ids.shape[1]:, ...]
         img = torch.cat((txt, img), 1)
         attn_mask = torch.cat((txt_mask, img_mask), 1)
-        for block in self.single_blocks:
+        for idx, block in enumerate(self.single_blocks):
             img, sub_token_select, token_logits = block(img, vec=vec, pe=pe, attn_mask=attn_mask)
             if (sub_token_select is not None) and (token_logits is not None):
                 token_select_list.append(sub_token_select)

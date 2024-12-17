@@ -1,11 +1,21 @@
 #!/usr/bin/env sh
 
-export HF_HOME="/data4/zl/.cache/huggingface"
+#SBATCH -p Gvlab-S1-32
+#SBATCH --gres=gpu:1
+#SBATCH --output slurm_output/%j.out
+#SBATCH --error slurm_output/%j.err
+#SBATCH --quotatype spot
+#SBATCH --job-name mage
+#SBATCH --requeue
+
+source ~/.bashrc
+conda activate diffusion
+export HF_TOKEN="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"
 
 train_data_root='configs/data/ft.yaml'
 
 model=NextDiT_2B_GQA_patch2
-batch_size=1
+batch_size=16
 lr=1e-4
 precision=bf16
 image_size=1024
@@ -19,12 +29,13 @@ mkdir -p results/"$exp_name"
 unset NCCL_IB_HCA
 # export TOKENIZERS_PARALLELISM=false
 
-CUDA_VISIBLE_DEVICES=7 MASTER_ADDR=localhost torchrun --nproc-per-node=1 --master_port 18183 train.py \
+srun -p lumina --gres=gpu:1 --cpus-per-task 8 --ntasks-per-node=1 --quotatype=spot --job-name merge \
+torchrun --nproc-per-node=1 --master_port 18183 train.py \
     --master_port 18181 \
     --model ${model} \
     --data_path ${train_data_root} \
-    --results_dir /home/pgao/zl/zl/ckpt/${exp_name} \
-    --micro_batch_size 1 \
+    --results_dir ./results/${exp_name} \
+    --micro_batch_size 4 \
     --global_batch_size ${batch_size} \
     --lr ${lr} \
     --grad_clip 2.0 \
@@ -38,6 +49,7 @@ CUDA_VISIBLE_DEVICES=7 MASTER_ADDR=localhost torchrun --nproc-per-node=1 --maste
     --global_seed 20240620 \
     --vae ${vae} \
     --num_workers 8 \
+    --checkpointing \
     --init_from $init_from \
     # 2>&1 | tee -a results/"$exp_name"/output.log
 # 

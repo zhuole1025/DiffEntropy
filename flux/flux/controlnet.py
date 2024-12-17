@@ -7,7 +7,7 @@ from einops import rearrange
 
 from .modules.layers import (DoubleStreamBlock, EmbedND, LastLayer,
                                  MLPEmbedder, SingleStreamBlock,
-                                 timestep_embedding)
+                                 timestep_embedding, zero_module)
 
 
 @dataclass
@@ -24,11 +24,6 @@ class FluxParams:
     theta: int
     qkv_bias: bool
     guidance_embed: bool
-
-def zero_module(module):
-    for p in module.parameters():
-        nn.init.zeros_(p)
-    return module
 
 
 class ControlNetFlux(nn.Module):
@@ -99,24 +94,6 @@ class ControlNetFlux(nn.Module):
         if self.compute_loss:
             self.decoder = LastLayer(self.hidden_size, 1, self.out_channels)
         
-        # self.input_hint_block = nn.Sequential(
-        #     nn.Conv2d(3, 16, 3, padding=1),
-        #     nn.SiLU(),
-        #     nn.Conv2d(16, 16, 3, padding=1),
-        #     nn.SiLU(),
-        #     nn.Conv2d(16, 16, 3, padding=1, stride=2),
-        #     nn.SiLU(),
-        #     nn.Conv2d(16, 16, 3, padding=1),
-        #     nn.SiLU(),
-        #     nn.Conv2d(16, 16, 3, padding=1, stride=2),
-        #     nn.SiLU(),
-        #     nn.Conv2d(16, 16, 3, padding=1),
-        #     nn.SiLU(),
-        #     nn.Conv2d(16, 16, 3, padding=1, stride=2),
-        #     nn.SiLU(),
-        #     zero_module(nn.Conv2d(16, 16, 3, padding=1))
-        # )
-
     def forward(
         self,
         img: Tensor,
@@ -135,8 +112,6 @@ class ControlNetFlux(nn.Module):
             raise ValueError("Input img and txt tensors must have 3 dimensions.")
         # running on sequences img
         img = self.img_in(img)
-        # controlnet_cond = self.input_hint_block(controlnet_cond)
-        # controlnet_cond = rearrange(controlnet_cond, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2)
         if controlnet_cond is not None:
             controlnet_cond = self.cond_img_in(controlnet_cond)
             img = img + controlnet_cond

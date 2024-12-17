@@ -13,10 +13,12 @@ low_res_list=256,512
 low_res_probs=0.5,0.5
 high_res_list=1024
 high_res_probs=1.0
-snr_type=lognorm
-controlnet_snr=uniform
+snr_type=uniform
+controlnet_snr=none
+backbone_cfg=1.0
+controlnet_cfg=1.0
 double_depth=2
-single_depth=4
+single_depth=2
 backbone_depth=19
 backbone_depth_single=38
 img_embedder_path='/data/huggingface/hub/models--black-forest-labs--FLUX.1-Redux-dev/snapshots/1282f955f706b5240161278f2ef261d2a29ad649/flux1-redux-dev.safetensors'
@@ -34,7 +36,7 @@ CUDA_VISIBLE_DEVICES=7 torchrun --nproc_per_node=1 --nnodes=1 --master_port 2933
     --data_path ${train_data_root} \
     --results_dir results/${exp_name} \
     --lr ${lr} --grad_clip 2.0 \
-    --data_parallel fsdp \
+    --data_parallel sdp \
     --max_steps 1000000 \
     --ckpt_every 1000 --log_every 1 \
     --precision ${precision} --grad_precision fp32 \
@@ -52,9 +54,11 @@ CUDA_VISIBLE_DEVICES=7 torchrun --nproc_per_node=1 --nnodes=1 --master_port 2933
     --backbone_depth ${backbone_depth} \
     --backbone_depth_single ${backbone_depth_single} \
     --img_embedder_path ${img_embedder_path} \
+    --backbone_cfg ${backbone_cfg} \
+    --controlnet_cfg ${controlnet_cfg} \
     --load_t5 \
     --load_clip \
-    --controlnet_snr ${controlnet_snr} \
-    --caption_dropout_prob 0.5 \
+    --caption_dropout_prob 1.0 \
     --debug \
+    # --controlnet_snr ${controlnet_snr} \
     

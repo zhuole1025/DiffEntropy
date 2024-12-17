@@ -1,0 +1,5 @@
+META:
+  -
+    path: '/data/zl/DiffEntropy/krea_2M_full_bucket.json'
+    type: 'image_text'
+    root: '/data/images'

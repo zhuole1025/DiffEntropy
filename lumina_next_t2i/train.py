@@ -19,6 +19,7 @@ import os
 import random
 import socket
 from time import time
+import wandb
 
 from PIL import Image
 from diffusers.models import AutoencoderKL
@@ -26,6 +27,11 @@ import fairscale.nn.model_parallel.initialize as fs_init
 import numpy as np
 import torch
 import torch.distributed as dist
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    CheckpointImpl,
+    apply_activation_checkpointing,
+    checkpoint_wrapper,
+)
 from torch.distributed.fsdp import (
     FullStateDictConfig,
     FullyShardedDataParallel as FSDP,
@@ -61,10 +67,45 @@ class T2IItemProcessor(ItemProcessor):
             assert "image" in data_item and len(data_item["conversations"]) == 2
             image = Image.open(read_general(data_item["image"])).convert("RGB")
             text = data_item["conversations"][1]["value"]
-        else:
+        elif "path" in data_item:
             image_path = data_item["path"]
             image = Image.open(read_general(image_path)).convert("RGB")
             text = data_item["prompt"]
+        elif "image_url" in data_item:
+            url = data_item["image_url"]
+            url = url.replace(
+                "/mnt/petrelfs/share_data/gaopeng/image_text_data",
+                "/mnt/hwfile/alpha_vl/gaopeng/share_data/image_text_data",
+            )
+            url = url.replace("/mnt/petrelfs/share_data/huxiangfei", "/mnt/hwfile/alpha_vl/huxiangfei")
+            image = Image.open(read_general(url)).convert("RGB")
+            caption_keys = [
+                "sharegpt4v_long_cap",
+                "cogvlm_long",
+                "blip2_short_cap",
+                "llava13b_long_cap",
+                "spatial_caption",
+                "coca_caption",
+                "user_prompt",
+                "tags_prompt",
+                "gpt4v_concise_elements",
+                "gpt4v_regions_detailed_description",
+                "gpt4v_detailed_description",
+                "gpt4v_concise_description",
+                'cogvlm_long_user_prompt_conditioned',
+                'internvl_V1.5_user_prompt_conditioned',
+                'cogvlm2_long_user_prompt_conditioned',
+                'florence2_cap',
+            ]
+            candidate_caps = [data_item[x] for x in caption_keys if x in data_item and data_item[x]]
+            text = random.choice(candidate_caps) if len(candidate_caps) else ""
+        elif "image" in data_item and "caption" in data_item:
+            image = Image.open(read_general(data_item["image"].replace("hzh:s3://", "cluster_s_hdd_gp:s3://"))).convert(
+                "RGB"
+            )
+            text = data_item["caption"]
+        else:
+            raise ValueError(f"Unrecognized item: {data_item}")
 
         image = self.image_transform(image)
 
@@ -192,6 +233,7 @@ def setup_fsdp_sync(model: nn.Module, args: argparse.Namespace) -> FSDP:
         sync_module_states=True,
         limit_all_gathers=True,
         use_orig_params=True,
+        forward_prefetch=True,
     )
     torch.cuda.synchronize()
 
@@ -285,6 +327,16 @@ def main(args):
                 datetime.now().strftime("%Y%m%d_%H%M%S_") + socket.gethostname(),
             )
         )
+        # Create wandb logger
+        if args.use_wandb:
+            wandb.init(
+                project="Lumina",
+                name=args.results_dir.split("/")[-1],
+                config=args.__dict__,  # Use args.__dict__ to pass all arguments
+                dir=args.results_dir,  # Set the directory for wandb files
+                job_type="training",
+                reinit=True,  # Allows multiple runs in the same process
+            )
     else:
         logger = create_logger(None)
         tb_logger = None
@@ -393,9 +445,33 @@ def main(args):
             logger.info(f"  Unexpeected keys: {unexpected_keys}")
     dist.barrier()
 
+    # should be called before FSDP wrapping
+    checkpointing_list = model.get_checkpointing_wrap_module_list()
+    checkpointing_list_ema = model_ema.get_checkpointing_wrap_module_list()
+    
     teacher = setup_fsdp_sync(teacher, args)
     model = setup_fsdp_sync(model, args)
     model_ema = setup_fsdp_sync(model_ema, args)
+    
+    # gradient checkpointing
+    if args.checkpointing:
+        print("apply gradient checkpointing")
+        non_reentrant_wrapper = functools.partial(
+            checkpoint_wrapper,
+            checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+        )
+        apply_activation_checkpointing(
+            model,
+            checkpoint_wrapper_fn=non_reentrant_wrapper,
+            check_fn=lambda submodule: submodule in checkpointing_list,
+        )
+        apply_activation_checkpointing(
+            model_ema,
+            checkpoint_wrapper_fn=non_reentrant_wrapper,
+            check_fn=lambda submodule: submodule in checkpointing_list_ema,
+        )
+
+    logger.info(f"model:\n{model}\n")
 
     # default: 1000 steps, linear noise schedule
     transport = create_transport("Linear", "velocity", None, None, None, snr_type=args.snr_type)  # default: velocity;
@@ -491,6 +567,7 @@ def main(args):
     # Variables for monitoring/logging purposes:
     log_steps = 0
     running_loss = 0
+    running_grad_norm = 0
     start_time = time()
 
     logger.info(f"Training for {args.max_steps:,} steps...")
@@ -519,16 +596,6 @@ def main(args):
 
         with torch.no_grad():
             cap_feats, cap_mask = encode_prompt(caps, text_encoder, tokenizer, args.caption_dropout_prob)
-
-        if mp_world_size > 1:
-            local_cap_feats = cap_feats
-            cap_feats = torch.zeros(
-                [mp_world_size, *local_cap_feats.size()],
-                dtype=local_cap_feats.dtype,
-                device=local_cap_feats.device,
-            )
-            dist.all_gather_into_tensor(cap_feats, local_cap_feats, group=mp_group)
-            cap_feats = cap_feats.flatten(0, 1)
 
         loss_item = 0.0
         opt.zero_grad()
@@ -562,6 +629,16 @@ def main(args):
             tb_logger.add_scalar("train/loss", loss_item, step)
             tb_logger.add_scalar("train/grad_norm", grad_norm, step)
             tb_logger.add_scalar("train/lr", opt.param_groups[0]["lr"], step)
+            
+        if args.use_wandb and rank == 0:
+            log_dict = {
+                "train/loss": loss_item,
+                "train/grad_norm": grad_norm,
+                "train/lr": opt.param_groups[0]["lr"],
+            }
+            for loss_name, loss_value in loss_dict.items():
+                log_dict[f"train/{loss_name}"] = loss_value
+            wandb.log(log_dict, step=step)
 
         opt.step()
         update_ema(model_ema, model)
@@ -573,6 +650,7 @@ def main(args):
 
         # Log loss values:
         running_loss += loss_item
+        running_grad_norm += grad_norm
         log_steps += 1
         if (step + 1) % args.log_every == 0:
             # Measure training speed:
@@ -584,19 +662,22 @@ def main(args):
             avg_loss = torch.tensor(running_loss / log_steps, device=device)
             dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
             avg_loss = avg_loss.item() / dist.get_world_size()
+            avg_grad_norm = running_grad_norm / log_steps
             logger.info(
                 f"(step={step + 1:07d}) "
                 f"Train Loss: {avg_loss:.4f}, "
+                f"Train Grad Norm: {avg_grad_norm:.4f}, "
                 f"Train Secs/Step: {secs_per_step:.2f}, "
-                f"Train Imgs/Sec: {imgs_per_sec:.2f}"
+                f"Train Imgs/Sec: {imgs_per_sec:.2f},"
             )
             # Reset monitoring variables:
             running_loss = 0
+            running_grad_norm = 0
             log_steps = 0
             start_time = time()
 
         # Save DiT checkpoint:
-        if step == 0 or (step + 1) % args.ckpt_every == 0 or (step + 1) == args.max_steps:
+        if (step + 1) % args.ckpt_every == 0 or (step + 1) == args.max_steps:
             checkpoint_path = f"{checkpoint_dir}/{step + 1:07d}"
             os.makedirs(checkpoint_path, exist_ok=True)
 
@@ -689,6 +770,7 @@ if __name__ == "__main__":
     parser.add_argument("--data_parallel", type=str, choices=["sdp", "fsdp"], default="fsdp")
     parser.add_argument("--precision", choices=["fp32", "tf32", "fp16", "bf16"], default="bf16")
     parser.add_argument("--grad_precision", choices=["fp32", "fp16", "bf16"])
+    parser.add_argument("--checkpointing", action="store_true", default=False, help="enable gradient checkpointing")
     parser.add_argument(
         "--local_diffusers_model_root",
         type=str,
@@ -736,6 +818,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--snr_type", type=str, default="uniform", choices=["uniform", "lognorm"])
     parser.add_argument("--steps_per_stage", type=int, default=1000)
+    parser.add_argument("--use_wandb", action="store_true", help="Use wandb to log training metrics.")
     args = parser.parse_args()
 
     main(args)

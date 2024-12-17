@@ -13,7 +13,6 @@ from PIL import Image
 import numpy as np
 import torch
 import torch.nn.functional as F
-import torch.distributed as dist
 from torchvision import transforms
 from torchvision.transforms.functional import to_pil_image
 from tqdm import tqdm
@@ -50,13 +49,11 @@ def main(args, rank, master_port):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-    dist.init_process_group("nccl")
     torch.cuda.set_device(rank)
     device_str = f"cuda:{rank}"
 
     train_args = torch.load(os.path.join(args.ckpt, "model_args.pth"))
-    if dist.get_rank() == 0:
-        print("Loaded model arguments:", json.dumps(train_args.__dict__, indent=2))
+    print("Loaded model arguments:", json.dumps(train_args.__dict__, indent=2))
 
     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[args.precision]
 
@@ -137,13 +134,12 @@ def main(args, rank, master_port):
     # end sampler
 
     sample_folder_dir = args.image_save_path
-
+    
     if rank == 0:
         os.makedirs(sample_folder_dir, exist_ok=True)
         os.makedirs(os.path.join(sample_folder_dir, "images"), exist_ok=True)
         os.makedirs(os.path.join(sample_folder_dir, "cond_images"), exist_ok=True)
         print(f"Saving .png samples at {sample_folder_dir}")
-    dist.barrier()
 
     info_path = os.path.join(args.image_save_path, "data.json")
     if os.path.exists(info_path):
@@ -310,12 +306,6 @@ def main(args, rank, master_port):
                         f.write(json.dumps(info))
 
                     total += len(samples)
-                    dist.barrier()
-
-    dist.barrier()
-    dist.barrier()
-    dist.destroy_process_group()
-
 
 def find_free_port() -> int:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

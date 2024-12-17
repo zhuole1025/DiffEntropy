@@ -1112,6 +1112,9 @@ class NextDiT(nn.Module):
     def get_fsdp_wrap_module_list(self) -> List[nn.Module]:
         return list(self.layers)
 
+    def get_checkpointing_wrap_module_list(self) -> List[nn.Module]:
+        return list(self.layers)
+
 
 #############################################################################
 #                                 NextDiT Configs                               #

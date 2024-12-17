@@ -1,0 +1,15 @@
+transformers
+diffusers
+torch
+torchvision
+wandb
+fairscale
+h5py
+einops
+ninja
+torchdiffeq
+accelerate
+opencv-python
+sentencepiece
+basicsr
+matplotlib

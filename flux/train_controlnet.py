@@ -547,7 +547,7 @@ def main(args):
         # elif 'norm' in name or 'bias' in name:
             # param.requires_grad = True
             # model_params.append(param)
-        elif 'gate' in name:
+        elif 'controlnet' in name:
             param.requires_grad = True
             controlnet_params.append(param)
         else:
@@ -803,7 +803,7 @@ def main(args):
                 x = [(ae.encode(img.to(ae.dtype)).latent_dist.sample()[0] - ae.config.shift_factor) * ae.config.scaling_factor for img in x]
             
         with torch.no_grad():
-            inp = prepare(t5=t5, clip=clip, img=x, img_cond=x_cond, prompt=caps, proportion_empty_prompts=args.caption_dropout_prob, proportion_empty_images=args.image_dropout_prob, text_emb=text_emb, img_embedder=img_embedder, raw_img_cond=raw_x_cond)
+            inp = prepare(t5=t5, clip=clip, img=x, img_cond=x_cond, prompt=caps, proportion_empty_prompts=args.caption_dropout_prob, proportion_empty_images=args.image_dropout_prob, text_emb=text_emb, img_embedder=img_embedder, raw_img_cond=raw_x_cond, cond_type=args.cond_type)
 
         loss_item = 0.0
         controlnet_loss_item = 0.0
@@ -933,56 +933,57 @@ def main(args):
             checkpoint_path = f"{checkpoint_dir}/{step + 1:07d}"
             os.makedirs(checkpoint_path, exist_ok=True)
 
-            with FSDP.state_dict_type(
-                model,
-                StateDictType.FULL_STATE_DICT,
-                FullStateDictConfig(rank0_only=True, offload_to_cpu=True),
-            ):
-                consolidated_model_state_dict = model.state_dict()
-                if fs_init.get_data_parallel_rank() == 0:
-                    consolidated_fn = (
-                        "consolidated."
-                        f"{fs_init.get_model_parallel_rank():02d}-of-"
-                        f"{fs_init.get_model_parallel_world_size():02d}"
-                        ".pth"
-                    )
-                    torch.save(
-                        consolidated_model_state_dict,
-                        os.path.join(checkpoint_path, consolidated_fn),
-                    )
-            dist.barrier()
-            del consolidated_model_state_dict
-            logger.info(f"Saved consolidated to {checkpoint_path}.")
+            if len(model_params) > 0:
+                with FSDP.state_dict_type(
+                    model,
+                    StateDictType.FULL_STATE_DICT,
+                    FullStateDictConfig(rank0_only=True, offload_to_cpu=True),
+                ):
+                    consolidated_model_state_dict = model.state_dict()
+                    if fs_init.get_data_parallel_rank() == 0:
+                        consolidated_fn = (
+                            "consolidated."
+                            f"{fs_init.get_model_parallel_rank():02d}-of-"
+                            f"{fs_init.get_model_parallel_world_size():02d}"
+                            ".pth"
+                        )
+                        torch.save(
+                            consolidated_model_state_dict,
+                            os.path.join(checkpoint_path, consolidated_fn),
+                        )
+                dist.barrier()
+                del consolidated_model_state_dict
+                logger.info(f"Saved consolidated to {checkpoint_path}.")
 
-            with FSDP.state_dict_type(
-                model_ema,
-                StateDictType.FULL_STATE_DICT,
-                FullStateDictConfig(rank0_only=True, offload_to_cpu=True),
-            ):
-                consolidated_ema_state_dict = model_ema.state_dict()
-                if fs_init.get_data_parallel_rank() == 0:
-                    consolidated_ema_fn = (
-                        "consolidated_ema."
-                        f"{fs_init.get_model_parallel_rank():02d}-of-"
-                        f"{fs_init.get_model_parallel_world_size():02d}"
-                        ".pth"
-                    )
-                    torch.save(
-                        consolidated_ema_state_dict,
-                        os.path.join(checkpoint_path, consolidated_ema_fn),
-                    )
-            dist.barrier()
-            del consolidated_ema_state_dict
-            logger.info(f"Saved consolidated_ema to {checkpoint_path}.")
+                with FSDP.state_dict_type(
+                    model_ema,
+                    StateDictType.FULL_STATE_DICT,
+                    FullStateDictConfig(rank0_only=True, offload_to_cpu=True),
+                ):
+                    consolidated_ema_state_dict = model_ema.state_dict()
+                    if fs_init.get_data_parallel_rank() == 0:
+                        consolidated_ema_fn = (
+                            "consolidated_ema."
+                            f"{fs_init.get_model_parallel_rank():02d}-of-"
+                            f"{fs_init.get_model_parallel_world_size():02d}"
+                            ".pth"
+                        )
+                        torch.save(
+                            consolidated_ema_state_dict,
+                            os.path.join(checkpoint_path, consolidated_ema_fn),
+                        )
+                dist.barrier()
+                del consolidated_ema_state_dict
+                logger.info(f"Saved consolidated_ema to {checkpoint_path}.")
 
-            with FSDP.state_dict_type(
-                model,
-                StateDictType.LOCAL_STATE_DICT,
-            ):
-                opt_state_fn = f"optimizer.{dist.get_rank():05d}-of-" f"{dist.get_world_size():05d}.pth"
-                torch.save(opt.state_dict(), os.path.join(checkpoint_path, opt_state_fn))
-            dist.barrier()
-            logger.info(f"Saved optimizer to {checkpoint_path}.")
+                with FSDP.state_dict_type(
+                    model,
+                    StateDictType.LOCAL_STATE_DICT,
+                ):
+                    opt_state_fn = f"optimizer.{dist.get_rank():05d}-of-" f"{dist.get_world_size():05d}.pth"
+                    torch.save(opt.state_dict(), os.path.join(checkpoint_path, opt_state_fn))
+                dist.barrier()
+                logger.info(f"Saved optimizer to {checkpoint_path}.")
             
             with FSDP.state_dict_type(
                 controlnet,
@@ -1115,6 +1116,7 @@ if __name__ == "__main__":
         default="0.2,0.7,0.1",
         help="Comma-separated list of probabilities for sampling low resolution images."
     )
+    parser.add_argument("--cond_type", type=str, default="image")
     parser.add_argument("--learnable_gate", action="store_true")
     parser.add_argument("--backbone_cfg", type=float, default=1.0)
     parser.add_argument("--controlnet_cfg", type=float, default=1.0)

@@ -119,9 +119,11 @@ def prepare(t5: HFEmbedder, clip: HFEmbedder, img: Tensor, img_cond: Tensor, pro
     
     if text_emb is not None:
         txt = torch.stack([item["txt"] for item in text_emb], dim=0).to(img.device)
-    else:
+    elif t5 is not None:
         txt = t5(prompt)
-
+    else:
+        txt = None
+        
     if img_embedder is not None:
         with torch.no_grad():
             global_img_cond = [img_embedder(raw_img_cond[i]) for i in range(bs)]
