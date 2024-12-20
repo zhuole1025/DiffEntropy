@@ -5,14 +5,14 @@ export HF_TOKEN="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"
 export HF_HOME="/data/huggingface"
 
 train_data_root='configs/data/2M.yaml'
-batch_size=8
+batch_size=16
 micro_batch_size=1
 generator_lr=1e-5
 guidance_lr=1e-5
 precision=bf16
-low_res_list=256
+low_res_list=1024
 low_res_probs=1.0
-high_res_list=256
+high_res_list=1024
 high_res_probs=1.0
 snr_type=lognorm
 num_discriminator_heads=8
@@ -23,7 +23,7 @@ mkdir -p results/"$exp_name"
 # unset NCCL_IB_HCA
 #export TOKENIZERS_PARALLELISM=false
 
-torchrun --nproc_per_node=1 --nnodes=1 --master_port 29338 train.py \
+torchrun --nproc_per_node=8 --nnodes=1 --master_port 29338 train.py \
     --master_port 18181 \
     --global_bs ${batch_size} \
     --micro_bs ${micro_batch_size} \
@@ -45,6 +45,6 @@ torchrun --nproc_per_node=1 --nnodes=1 --master_port 29338 train.py \
     --low_res_list ${low_res_list} \
     --low_res_probs ${low_res_probs} \
     --num_discriminator_heads ${num_discriminator_heads} \
-    --debug \
+    --checkpointing \
     --full_model \
     

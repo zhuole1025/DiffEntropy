@@ -13,7 +13,7 @@ low_res_list=256
 low_res_probs=1.0
 high_res_list=1024
 high_res_probs=1.0
-snr_type=uniform
+snr_type=lognorm
 controlnet_snr=none
 backbone_cfg=1.0
 controlnet_cfg=1.0
@@ -40,7 +40,7 @@ torchrun --nproc_per_node=8 --nnodes=1 --master_port 29311 train_controlnet.py \
     --lr ${lr} --grad_clip 2.0 \
     --data_parallel fsdp \
     --max_steps 1000000 \
-    --ckpt_every 500 --log_every 10 \
+    --ckpt_every 100 --log_every 10 \
     --precision ${precision} --grad_precision fp32 \
     --global_seed 20240826 \
     --num_workers 12 \
@@ -62,7 +62,7 @@ torchrun --nproc_per_node=8 --nnodes=1 --master_port 29311 train_controlnet.py \
     --caption_dropout_prob 1.0 \
     --cond_type image \
     --checkpointing \
-    # --learnable_gate \
+step0000500    # --learnable_gate \
     # --init_from ${init_from} \
     # --controlnet_snr ${controlnet_snr} \
     # --compute_controlnet_loss \

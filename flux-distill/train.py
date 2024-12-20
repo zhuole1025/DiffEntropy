@@ -55,7 +55,6 @@ from flux.model import Flux, FluxParams, FluxLoraWrapper, FluxUnifiedWrapper
 from flux.util import load_ae, load_clip, load_flow_model, load_t5, configs, print_load_warning
 from imgproc import generate_crop_size_list, to_rgb_if_rgba, var_center_crop, ASPECT_RATIO_1024, ASPECT_RATIO_2048, ASPECT_RATIO_256, ASPECT_RATIO_512
 from parallel import distributed_init, get_intra_node_process_group
-from transport import create_transport, Transport
 from util.misc import SmoothedValue
 
 #############################################################################
@@ -215,7 +214,13 @@ def setup_lm_fsdp_sync(model: nn.Module, auto_wrap_policy) -> FSDP:
     return model
 
 
-def setup_fsdp_sync(model: nn.Module, args: argparse.Namespace) -> FSDP:
+def setup_fsdp_sync(model: nn.Module, args: argparse.Namespace, rank: int) -> FSDP:
+    
+    if rank == 0:
+        param_init_fn = None
+    else:
+        param_init_fn = lambda x: x.to_empty(device=torch.cuda.current_device(), recurse=False)
+        
     model = FSDP(
         model,
         auto_wrap_policy=functools.partial(
@@ -245,6 +250,7 @@ def setup_fsdp_sync(model: nn.Module, args: argparse.Namespace) -> FSDP:
         sync_module_states=True,
         limit_all_gathers=True,
         use_orig_params=True,
+        param_init_fn=param_init_fn,
     )
     torch.cuda.synchronize()
 
@@ -259,6 +265,23 @@ def setup_mixed_precision(args):
         pass
     else:
         raise NotImplementedError(f"Unknown precision: {args.precision}")
+
+
+def accumulate_log_dict(accumulated, new_dict):
+    """Recursively accumulate values from new_dict into accumulated dict."""
+    if accumulated is None:
+        return new_dict
+        
+    for k, v in new_dict.items():
+        if isinstance(v, torch.Tensor):
+            accumulated[k] = torch.cat([accumulated[k], v], dim=0)
+        elif isinstance(v, list):
+            accumulated[k].extend(v)  # Using extend instead of += for better performance
+        elif isinstance(v, dict):
+            accumulated[k] = accumulate_log_dict(accumulated[k], v)
+        else:
+            accumulated[k] = v  # For other types, just update
+    return accumulated
 
 
 #############################################################################
@@ -308,12 +331,20 @@ def main(args):
 
     logger.info("Training arguments: " + json.dumps(args.__dict__, indent=2))
     
+    ae = AutoencoderKL.from_pretrained(f"black-forest-labs/FLUX.1-dev", subfolder="vae", torch_dtype=torch.bfloat16).to(device)
+    ae.requires_grad_(False)
+    logger.info("VAE loaded")
+    
     config = configs["flux-dev"]
     ckpt_path = hf_hub_download(config.repo_id, config.repo_flow)
-    with torch.device(device):
-        model = FluxUnifiedWrapper(params=config.params, num_discriminator_heads=args.num_discriminator_heads, snr_type=args.snr_type, do_shift=args.do_shift, grid_size=args.grid_size)
+    if rank == 0:
+        model = FluxUnifiedWrapper(params=config.params, num_discriminator_heads=args.num_discriminator_heads, snr_type=args.snr_type, do_shift=args.do_shift, grid_size=args.grid_size, device=device_str, offload_to_cpu=True, vae=ae)
+    else:
+        from accelerate import init_empty_weights
+        with init_empty_weights():
+            model = FluxUnifiedWrapper(params=config.params, num_discriminator_heads=args.num_discriminator_heads, snr_type=args.snr_type, do_shift=args.do_shift, grid_size=args.grid_size, device=device_str, offload_to_cpu=False, vae=ae)
     sd = load_sft(ckpt_path, device=str(device_str))
-    model.load_state_dict(sd, sd)
+    model.load_state_dict(sd)
     del sd
     torch.cuda.empty_cache()
     logger.info("DiT loaded")
@@ -345,23 +376,23 @@ def main(args):
         clip = None
 
     generator_params = model.generator.parameters()
-    guidance_params = []
-    for name, param in model.guidance.named_parameters():
-        if 'lora' in name:
-            param.requires_grad = True
-            guidance_params.append(param)
-        elif 'discriminator' in name:
-            param.requires_grad = True
-            guidance_params.append(param)
-        else:
-            param.requires_grad = False
+    guidance_params = model.fake_model.parameters()
+    model.real_model.requires_grad_(False)
+    model.fake_model.requires_grad_(True)
     model.generator.requires_grad_(True)
+    # guidance_params = []
+    # for name, param in model.guidance.named_parameters():
+    #     if 'lora' in name:
+    #         param.requires_grad = True
+    #         guidance_params.append(param)
+    #     elif 'discriminator' in name:
+    #         param.requires_grad = True
+    #         guidance_params.append(param)
+    #     else:
+    #         param.requires_grad = False
     total_params = model.generator.parameter_count()
     size_in_gb = total_params * 4 / 1e9
     logger.info(f"Model Size: {size_in_gb:.2f} GB, Student Parameters: {total_params / 1e9:.2f} B, Guidance Parameters: {sum(p.numel() for p in guidance_params) / 1e9:.2f} B")
-    
-    ae = AutoencoderKL.from_pretrained(f"black-forest-labs/FLUX.1-dev", subfolder="vae", torch_dtype=torch.bfloat16).to(device)
-    ae.requires_grad_(False)
     
     if args.auto_resume and args.resume is None:
         try:
@@ -431,18 +462,19 @@ def main(args):
             logger.info(f"  Missing keys: {missing_keys}")
             logger.info(f"  Unexpeected keys: {unexpected_keys}")
     dist.barrier()
-
+    
     # checkpointing (part1, should be called before FSDP wrapping)
     if args.checkpointing:
         checkpointing_list = list(model.generator.get_checkpointing_wrap_module_list())
-        checkpointing_guidance_list = list(model.guidance.get_checkpointing_wrap_module_list())
+        checkpointing_guidance_list = list(model.fake_model.get_checkpointing_wrap_module_list())
         # checkpointing_list_ema = list(model_ema.get_checkpointing_wrap_module_list())
     else:
         checkpointing_list = []
         # checkpointing_list_ema = []
 
-    model.generator = setup_fsdp_sync(model.generator, args)
-    model.guidance = setup_fsdp_sync(model.guidance, args)
+    model.generator = setup_fsdp_sync(model.generator, args, rank)
+    model.fake_model = setup_fsdp_sync(model.fake_model, args, rank)
+    model.real_model = setup_fsdp_sync(model.real_model, args, rank)
     # model_ema = setup_fsdp_sync(model_ema, args)
     
     # checkpointing (part2, after FSDP wrapping)
@@ -518,14 +550,6 @@ def main(args):
     else:
         resume_step = 0
     
-    # default: 1000 steps, linear noise schedule
-    transport = Transport(
-        snr_type=args.snr_type,
-        do_shift=args.do_shift,
-        vae=ae,
-        grid_size=1
-    )
-
     # Setup data:
     logger.info(f"Creating data")
     data_collection = {}
@@ -613,7 +637,6 @@ def main(args):
             "local_bsz": local_bsz,
             "micro_bsz": micro_bsz,
             "metrics": defaultdict(lambda: SmoothedValue(args.log_every)),
-            "transport": transport,
         }
 
     # Variables for monitoring/logging purposes:
@@ -645,12 +668,15 @@ def main(args):
         with torch.no_grad():
             x_denoise = [(ae.encode(img[None].to(ae.dtype)).latent_dist.sample()[0] - ae.config.shift_factor) * ae.config.scaling_factor for img in x_denoise]
             
+            x_real = [(ae.encode(img[None].to(ae.dtype)).latent_dist.sample()[0] - ae.config.shift_factor) * ae.config.scaling_factor for img in x_real]
+            
         with torch.no_grad():
             inp = prepare(t5=t5, clip=clip, img=x_denoise, prompt=caps, proportion_empty_prompts=args.caption_dropout_prob, text_emb=text_emb)
+            
+            real_inp = prepare(t5=t5, clip=clip, img=x_real, prompt=caps_real, proportion_empty_prompts=args.caption_dropout_prob, text_emb=text_emb_real)
         
-        noise = torch.randn_like(inp["img"])
-
         generator_loss_item = 0.0
+        accumulated_generator_log_dict = None
         guidance = torch.full((bsz,), 1.0, device=device, dtype=inp["img"].dtype)
         for mb_idx in range((data_pack["local_bsz"] - 1) // data_pack["micro_bsz"] + 1):
             mb_st = mb_idx * data_pack["micro_bsz"]
@@ -668,20 +694,8 @@ def main(args):
                 guidance=guidance[mb_st:mb_ed],
                 height=inp["height"],
                 width=inp["width"],
-                noise=noise[mb_st:mb_ed],
             )
-            
-            # extra_kwargs = dict(
-            #     img_ids=inp["img_ids"][mb_st:mb_ed],
-            #     txt=txt_uncond[mb_st:mb_ed],
-            #     txt_ids=txt_uncond_ids[mb_st:mb_ed],
-            #     txt_mask=txt_uncond_mask[mb_st:mb_ed],
-            #     y=vec_uncond[mb_st:mb_ed],
-            #     img_mask=inp["img_mask"][mb_st:mb_ed],
-            #     drop_mask=inp["drop_mask"][mb_st:mb_ed],
-            #     guidance=torch.full((x_mb.shape[0],), 1.0, device=x_mb.device, dtype=x_mb.dtype),
-            # )
-            
+
             with {
                 "bf16": torch.cuda.amp.autocast(dtype=torch.bfloat16),
                 "fp16": torch.cuda.amp.autocast(dtype=torch.float16),
@@ -696,6 +710,8 @@ def main(args):
                     visual=visual,
                 )
                 
+            accumulated_generator_log_dict = accumulate_log_dict(accumulated_generator_log_dict, generator_log_dict)
+            
             loss_dm = generator_loss_dict["loss_dm"].sum() / data_pack["local_bsz"]
             gen_cls_loss = generator_loss_dict["gen_cls_loss"].sum() / data_pack["local_bsz"]
             generator_loss = loss_dm * args.dm_loss_weight + gen_cls_loss * args.gen_cls_loss_weight
@@ -703,29 +719,31 @@ def main(args):
             
             with model.no_sync() if args.data_parallel in ["sdp"] and not last_mb else contextlib.nullcontext():
                 generator_loss.backward()
-        breakpoint()
-        grad_norm = model.clip_grad_norm_(max_norm=args.grad_clip)
+                
+        grad_norm = model.generator.clip_grad_norm_(max_norm=args.grad_clip)
         opt_generator.step()
         opt_generator.zero_grad()
         opt_guidance.zero_grad()
         
+        guidance_loss_item = 0.0
         for mb_idx in range((data_pack["local_bsz"] - 1) // data_pack["micro_bsz"] + 1):
             mb_st = mb_idx * data_pack["micro_bsz"]
             mb_ed = min((mb_idx + 1) * data_pack["micro_bsz"], data_pack["local_bsz"])
             last_mb = mb_ed == data_pack["local_bsz"]
             
-            model_kwargs = dict(
-                img=inp["img"][mb_st:mb_ed],
-                img_ids=inp["img_ids"][mb_st:mb_ed],
-                txt=inp["txt"][mb_st:mb_ed],
-                txt_ids=inp["txt_ids"][mb_st:mb_ed],
-                txt_mask=inp["txt_mask"][mb_st:mb_ed],
-                y=inp["vec"][mb_st:mb_ed],
-                img_mask=inp["img_mask"][mb_st:mb_ed],
+            model_kwargs["img"] = accumulated_generator_log_dict["guidance_data_dict"]["img"][mb_st:mb_ed]
+            
+            extra_kwargs = dict(
+                img=real_inp["img"][mb_st:mb_ed],
+                img_ids=real_inp["img_ids"][mb_st:mb_ed],
+                txt=real_inp["txt"][mb_st:mb_ed],
+                txt_ids=real_inp["txt_ids"][mb_st:mb_ed],
+                txt_mask=real_inp["txt_mask"][mb_st:mb_ed],
+                y=real_inp["vec"][mb_st:mb_ed],
+                img_mask=real_inp["img_mask"][mb_st:mb_ed],
                 guidance=guidance[mb_st:mb_ed],
-                height=inp["height"],
-                width=inp["width"],
-                noise=noise[mb_st:mb_ed],
+                height=real_inp["height"],
+                width=real_inp["width"],
             )
             
             with {
@@ -734,10 +752,9 @@ def main(args):
                 "fp32": contextlib.nullcontext(),
                 "tf32": contextlib.nullcontext(),
             }[args.precision]:
-                generator_loss_dict, generator_log_dict = data_pack["transport"].training_losses(
-                    model=model, 
-                    guidance_model=guidance_model, 
+                generator_loss_dict, generator_log_dict = model(
                     model_kwargs=model_kwargs, 
+                    extra_kwargs=extra_kwargs,
                     generator_turn=False,
                     guidance_turn=True,
                     compute_generator_gradient=COMPUTE_GENERATOR_GRADIENT,
@@ -752,7 +769,7 @@ def main(args):
             with model.no_sync() if args.data_parallel in ["sdp"] and not last_mb else contextlib.nullcontext():
                 guidance_loss.backward()
 
-        grad_norm = model.clip_grad_norm_(max_norm=args.grad_clip)
+        grad_norm = model.fake_model.clip_grad_norm_(max_norm=args.grad_clip)
         opt_guidance.step()
         opt_generator.zero_grad()
         opt_guidance.zero_grad()
@@ -761,7 +778,8 @@ def main(args):
         
         if args.use_wandb and rank == 0:
             wandb.log({
-                "train/loss": loss_item,
+                "train/generator_loss": generator_loss_item,
+                "train/guidance_loss": guidance_loss_item,
                 "train/grad_norm": grad_norm,
                 "train/generator_lr": opt_generator.param_groups[0]["lr"],
                 "train/guidance_lr": opt_guidance.param_groups[0]["lr"],
@@ -769,19 +787,18 @@ def main(args):
 
         # Log loss values:
         metrics = data_pack["metrics"]
-        metrics["loss"].update(loss_item)
-        metrics["cfg_loss"].update(cfg_loss_item)
-        metrics["diff_loss"].update(diff_loss_item)
+        metrics["generator_loss"].update(generator_loss_item)
+        metrics["guidance_loss"].update(guidance_loss_item)
         metrics["grad_norm"].update(grad_norm)
         metrics["Secs/Step"].update(end_time - start_time)
         metrics["Imgs/Sec"].update(data_pack["global_bsz"] / (end_time - start_time))
-        metrics["grad_norm"].update(grad_norm)
         if (step + 1) % args.log_every == 0:
             # Measure training speed:
             torch.cuda.synchronize()
             logger.info(
                 f"Res{high_res}: (step{step + 1:07d}) "
-                + f"lr{opt.param_groups[0]['lr']:.6f} "
+                + f"lr{opt_generator.param_groups[0]['lr']:.6f} "
+                + f"lr{opt_guidance.param_groups[0]['lr']:.6f} "
                 + " ".join([f"{key}:{str(val)}" for key, val in metrics.items()])
             )
 
@@ -950,13 +967,14 @@ if __name__ == "__main__":
     )
     parser.add_argument("--visual_every", type=int, default=100)
     parser.add_argument("--grid_size", type=int, default=2)
+    parser.add_argument("--guidance_loss_weight", type=float, default=1.0)
+    parser.add_argument("--guidance_cls_loss_weight", type=float, default=1.0)
     parser.add_argument("--dm_loss_weight", type=float, default=1.0)
     parser.add_argument("--gen_cls_loss_weight", type=float, default=1.0)
     parser.add_argument("--num_discriminator_heads", type=int, default=0)
     parser.add_argument("--dfake_gen_update_ratio", type=int, default=1)
     parser.add_argument("--full_model", action="store_true")
     parser.add_argument("--use_wandb", action="store_true")
-    parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
     args.low_res_list = [int(res) for res in args.low_res_list.split(",")]
     args.high_res_list = [int(res) for res in args.high_res_list.split(",")]
