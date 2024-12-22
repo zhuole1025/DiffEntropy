@@ -148,7 +148,6 @@ class Flux(nn.Module):
                 if self.learnable_gate:
                     gate = torch.tanh(self.double_controlnet_gates[idx](img, double_controls[idx % len(double_controls)], vec))
                     img = img + double_controls[idx % len(double_controls)] * gate
-                    print("double: ", timesteps[0].item(), idx, gate.abs().mean().item(), gate.abs().var().item())
                 else:
                     img = img + double_controls[idx % len(double_controls)] * double_gate
                 # gate_logits_list.append(gate)
@@ -166,7 +165,6 @@ class Flux(nn.Module):
                 if self.learnable_gate:
                     gate = torch.tanh(self.single_controlnet_gates[idx](img, single_controls[idx % len(single_controls)], vec))
                     img = img + single_controls[idx % len(single_controls)] * gate
-                    print("single: ", timesteps[0].item(), idx, gate.abs().mean().item(), gate.abs().var().item())
                 else:
                     img = img + single_controls[idx % len(single_controls)] * single_gate
                 

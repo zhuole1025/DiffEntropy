@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 
 export HF_TOKEN="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"
-export HF_HOME="/data/huggingface"
+export HF_HOME="/ceph/data-bk/huggingface"
 
 
 train_data_root='configs/data/2M.yaml'

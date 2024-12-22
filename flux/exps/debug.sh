@@ -2,7 +2,7 @@
 
 export WANDB_API_KEY="75de1215548653cdc8084ae0d1450f2d84fd9a20"
 export HF_TOKEN="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"
-export HF_HOME="/data/huggingface"
+export HF_HOME="/ceph/data-bk/huggingface"
 
 train_data_root='configs/data/2M.yaml'
 batch_size=4
@@ -21,7 +21,7 @@ double_depth=2
 single_depth=2
 backbone_depth=19
 backbone_depth_single=38
-img_embedder_path='/data/huggingface/hub/models--black-forest-labs--FLUX.1-Redux-dev/snapshots/1282f955f706b5240161278f2ef261d2a29ad649/flux1-redux-dev.safetensors'
+img_embedder_path='/ceph/data-bk/huggingface/hub/models--black-forest-labs--FLUX.1-Redux-dev/snapshots/1282f955f706b5240161278f2ef261d2a29ad649/flux1-redux-dev.safetensors'
 
 exp_name=test
 mkdir -p results/"$exp_name"

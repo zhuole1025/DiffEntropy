@@ -55,13 +55,11 @@ from flux.model import Flux, FluxParams, FluxLoraWrapper, FluxUnifiedWrapper
 from flux.util import load_ae, load_clip, load_flow_model, load_t5, configs, print_load_warning
 from imgproc import generate_crop_size_list, to_rgb_if_rgba, var_center_crop, ASPECT_RATIO_1024, ASPECT_RATIO_2048, ASPECT_RATIO_256, ASPECT_RATIO_512
 from parallel import distributed_init, get_intra_node_process_group
-from transport import create_transport, Transport
 from util.misc import SmoothedValue
 
 #############################################################################
 #                            Data item Processor                            #
 #############################################################################
-
 
 
 class T2IItemProcessor(ItemProcessor):
@@ -215,7 +213,13 @@ def setup_lm_fsdp_sync(model: nn.Module, auto_wrap_policy) -> FSDP:
     return model
 
 
-def setup_fsdp_sync(model: nn.Module, args: argparse.Namespace) -> FSDP:
+def setup_fsdp_sync(model: nn.Module, args: argparse.Namespace, rank: int) -> FSDP:
+    
+    if rank == 0:
+        param_init_fn = None
+    else:
+        param_init_fn = lambda x: x.to_empty(device=torch.cuda.current_device(), recurse=False)
+        
     model = FSDP(
         model,
         auto_wrap_policy=functools.partial(
@@ -245,6 +249,7 @@ def setup_fsdp_sync(model: nn.Module, args: argparse.Namespace) -> FSDP:
         sync_module_states=True,
         limit_all_gathers=True,
         use_orig_params=True,
+        param_init_fn=param_init_fn,
     )
     torch.cuda.synchronize()
 
@@ -259,6 +264,23 @@ def setup_mixed_precision(args):
         pass
     else:
         raise NotImplementedError(f"Unknown precision: {args.precision}")
+
+
+def accumulate_log_dict(accumulated, new_dict):
+    """Recursively accumulate values from new_dict into accumulated dict."""
+    if accumulated is None:
+        return new_dict
+        
+    for k, v in new_dict.items():
+        if isinstance(v, torch.Tensor):
+            accumulated[k] = torch.cat([accumulated[k], v], dim=0)
+        elif isinstance(v, list):
+            accumulated[k].extend(v)  # Using extend instead of += for better performance
+        elif isinstance(v, dict):
+            accumulated[k] = accumulate_log_dict(accumulated[k], v)
+        else:
+            accumulated[k] = v  # For other types, just update
+    return accumulated
 
 
 #############################################################################
@@ -296,7 +318,7 @@ def main(args):
         # Create wandb logger
         if args.use_wandb:
             wandb.init(
-                project="FLUX",
+                project="FLUX-distill",
                 name=args.results_dir.split("/")[-1],
                 config=args.__dict__,  # Use args.__dict__ to pass all arguments
                 dir=args.results_dir,  # Set the directory for wandb files
@@ -308,13 +330,21 @@ def main(args):
 
     logger.info("Training arguments: " + json.dumps(args.__dict__, indent=2))
     
+    ae = AutoencoderKL.from_pretrained(f"black-forest-labs/FLUX.1-dev", subfolder="vae", torch_dtype=torch.bfloat16).to(device)
+    ae.requires_grad_(False)
+    logger.info("VAE loaded")
+    
     config = configs["flux-dev"]
     ckpt_path = hf_hub_download(config.repo_id, config.repo_flow)
-    with torch.device(device):
-        model = FluxUnifiedWrapper(params=config.params, num_discriminator_heads=args.num_discriminator_heads, snr_type=args.snr_type, do_shift=args.do_shift, grid_size=args.grid_size)
-    sd = load_sft(ckpt_path, device=str(device_str))
-    model.load_state_dict(sd, sd)
-    del sd
+    if rank == 0:
+        model = FluxUnifiedWrapper(params=config.params, num_discriminator_heads=args.num_discriminator_heads, snr_type=args.snr_type, do_shift=args.do_shift, grid_size=args.grid_size, device=device_str, offload_to_cpu=True, vae=ae, num_denoising_step=args.num_denoising_step, min_step_percent=args.min_step_percent, max_step_percent=args.max_step_percent, real_guidance_scale=args.real_guidance_scale, fake_guidance_scale=args.fake_guidance_scale, generator_guidance_scale=args.generator_guidance_scale, generator_loss_type=args.generator_loss_type)
+        sd = load_sft(ckpt_path, device=str(device_str))
+        model.load_state_dict(sd)
+        del sd
+    else:
+        from accelerate import init_empty_weights
+        with init_empty_weights():
+            model = FluxUnifiedWrapper(params=config.params, num_discriminator_heads=args.num_discriminator_heads, snr_type=args.snr_type, do_shift=args.do_shift, grid_size=args.grid_size, device=device_str, offload_to_cpu=False, vae=ae, num_denoising_step=args.num_denoising_step, min_step_percent=args.min_step_percent, max_step_percent=args.max_step_percent, real_guidance_scale=args.real_guidance_scale, fake_guidance_scale=args.fake_guidance_scale, generator_guidance_scale=args.generator_guidance_scale, generator_loss_type=args.generator_loss_type)
     torch.cuda.empty_cache()
     logger.info("DiT loaded")
 
@@ -345,23 +375,23 @@ def main(args):
         clip = None
 
     generator_params = model.generator.parameters()
-    guidance_params = []
-    for name, param in model.guidance.named_parameters():
-        if 'lora' in name:
-            param.requires_grad = True
-            guidance_params.append(param)
-        elif 'discriminator' in name:
-            param.requires_grad = True
-            guidance_params.append(param)
-        else:
-            param.requires_grad = False
+    guidance_params = model.fake_model.parameters()
+    model.real_model.requires_grad_(False)
+    model.fake_model.requires_grad_(True)
     model.generator.requires_grad_(True)
+    # guidance_params = []
+    # for name, param in model.guidance.named_parameters():
+    #     if 'lora' in name:
+    #         param.requires_grad = True
+    #         guidance_params.append(param)
+    #     elif 'discriminator' in name:
+    #         param.requires_grad = True
+    #         guidance_params.append(param)
+    #     else:
+    #         param.requires_grad = False
     total_params = model.generator.parameter_count()
     size_in_gb = total_params * 4 / 1e9
     logger.info(f"Model Size: {size_in_gb:.2f} GB, Student Parameters: {total_params / 1e9:.2f} B, Guidance Parameters: {sum(p.numel() for p in guidance_params) / 1e9:.2f} B")
-    
-    ae = AutoencoderKL.from_pretrained(f"black-forest-labs/FLUX.1-dev", subfolder="vae", torch_dtype=torch.bfloat16).to(device)
-    ae.requires_grad_(False)
     
     if args.auto_resume and args.resume is None:
         try:
@@ -431,18 +461,19 @@ def main(args):
             logger.info(f"  Missing keys: {missing_keys}")
             logger.info(f"  Unexpeected keys: {unexpected_keys}")
     dist.barrier()
-
+    
     # checkpointing (part1, should be called before FSDP wrapping)
     if args.checkpointing:
         checkpointing_list = list(model.generator.get_checkpointing_wrap_module_list())
-        checkpointing_guidance_list = list(model.guidance.get_checkpointing_wrap_module_list())
+        checkpointing_guidance_list = list(model.fake_model.get_checkpointing_wrap_module_list())
         # checkpointing_list_ema = list(model_ema.get_checkpointing_wrap_module_list())
     else:
         checkpointing_list = []
         # checkpointing_list_ema = []
-
-    model.generator = setup_fsdp_sync(model.generator, args)
-    model.guidance = setup_fsdp_sync(model.guidance, args)
+    
+    model.generator = setup_fsdp_sync(model.generator, args, rank)
+    model.fake_model = setup_fsdp_sync(model.fake_model, args, rank)
+    model.real_model = setup_fsdp_sync(model.real_model, args, rank)
     # model_ema = setup_fsdp_sync(model_ema, args)
     
     # checkpointing (part2, after FSDP wrapping)
@@ -518,14 +549,6 @@ def main(args):
     else:
         resume_step = 0
     
-    # default: 1000 steps, linear noise schedule
-    transport = Transport(
-        snr_type=args.snr_type,
-        do_shift=args.do_shift,
-        vae=ae,
-        grid_size=1
-    )
-
     # Setup data:
     logger.info(f"Creating data")
     data_collection = {}
@@ -538,16 +561,10 @@ def main(args):
     patch_size = 16
     logger.info(f"patch size: {patch_size}")
     for train_res in args.high_res_list:
-        scale_factor = train_res // min(args.low_res_list)
-        max_num_patches = round((train_res / patch_size) ** 2) // scale_factor * scale_factor
-        crop_size_list = generate_crop_size_list(max_num_patches, patch_size, step_size=scale_factor)
-        logger.info("List of crop sizes:")
-        for i in range(0, len(crop_size_list), 6):
-            logger.info(" " + "".join([f"{f'{w} x {h}':14s}" for w, h in crop_size_list[i : i + 6]]))
         image_transform = transforms.Compose(
             [
                 transforms.Lambda(lambda img: to_rgb_if_rgba(img)),
-                transforms.Lambda(functools.partial(var_center_crop, crop_size_list=crop_size_list, random_top_k=1)),
+                transforms.Lambda(functools.partial(var_center_crop, crop_size_dict=eval(f'ASPECT_RATIO_{train_res}'))),
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
             ]
@@ -576,20 +593,6 @@ def main(args):
             aspect_ratios=eval(f'ASPECT_RATIO_{train_res}'),
             drop_last=True,
         )
-        loader = DataLoader(
-            dataset,
-            batch_sampler=batch_sampler,
-            num_workers=args.num_workers,
-            pin_memory=True,
-            collate_fn=dataloader_collate_fn,
-        )
-        guidance_loader = DataLoader(
-            dataset,
-            batch_sampler=batch_sampler,
-            num_workers=args.num_workers,
-            pin_memory=True,
-            collate_fn=dataloader_collate_fn,
-        )
         denoising_loader = DataLoader(
             dataset,
             batch_sampler=batch_sampler,
@@ -605,15 +608,12 @@ def main(args):
             collate_fn=dataloader_collate_fn,
         )
         data_collection[train_res] = {
-            "loader_iter": iter(loader),
-            "guidance_loader_iter": iter(guidance_loader),
             "denoising_loader_iter": iter(denoising_loader),
             "real_loader_iter": iter(real_loader),
             "global_bsz": global_bsz,
             "local_bsz": local_bsz,
             "micro_bsz": micro_bsz,
             "metrics": defaultdict(lambda: SmoothedValue(args.log_every)),
-            "transport": transport,
         }
 
     # Variables for monitoring/logging purposes:
@@ -630,58 +630,42 @@ def main(args):
         data_pack = data_collection[high_res]
         visual = step % args.visual_every == 0
         
-        if COMPUTE_GENERATOR_GRADIENT:
-            _, caps, text_emb = next(data_pack['loader_iter'])
-        else:
-            _, caps, text_emb = next(data_pack["guidance_loader_iter"])
-        
         x_denoise, caps_denoise, text_emb_denoise = next(data_pack["denoising_loader_iter"])
         x_real, caps_real, text_emb_real = next(data_pack["real_loader_iter"])
-
-        x_denoise = [img.to(device, non_blocking=True) for img in x_denoise]
-        x_real = [img.to(device, non_blocking=True) for img in x_real]
-        bsz = len(caps)
+        
+        x_denoise = torch.stack([img.to(device, non_blocking=True) for img in x_denoise])
+        x_real = torch.stack([img.to(device, non_blocking=True) for img in x_real])
+        bsz = len(caps_denoise)
         
         with torch.no_grad():
-            x_denoise = [(ae.encode(img[None].to(ae.dtype)).latent_dist.sample()[0] - ae.config.shift_factor) * ae.config.scaling_factor for img in x_denoise]
+            x_denoise = (ae.encode(x_denoise.to(ae.dtype)).latent_dist.sample() - ae.config.shift_factor) * ae.config.scaling_factor
+            
+            x_real = (ae.encode(x_real.to(ae.dtype)).latent_dist.sample() - ae.config.shift_factor) * ae.config.scaling_factor
             
         with torch.no_grad():
-            inp = prepare(t5=t5, clip=clip, img=x_denoise, prompt=caps, proportion_empty_prompts=args.caption_dropout_prob, text_emb=text_emb)
-        
-        noise = torch.randn_like(inp["img"])
-
+            inp_denoise = prepare(t5=t5, clip=clip, img=x_denoise, prompt=caps_denoise, proportion_empty_prompts=args.caption_dropout_prob, text_emb=text_emb_denoise)
+            
+            inpt_real = prepare(t5=t5, clip=clip, img=x_real, prompt=caps_real, proportion_empty_prompts=args.caption_dropout_prob, text_emb=text_emb_real)
+            
         generator_loss_item = 0.0
-        guidance = torch.full((bsz,), 1.0, device=device, dtype=inp["img"].dtype)
+        accumulated_generator_log_dict = None
         for mb_idx in range((data_pack["local_bsz"] - 1) // data_pack["micro_bsz"] + 1):
             mb_st = mb_idx * data_pack["micro_bsz"]
             mb_ed = min((mb_idx + 1) * data_pack["micro_bsz"], data_pack["local_bsz"])
             last_mb = mb_ed == data_pack["local_bsz"]
             
-            model_kwargs = dict(
-                img=inp["img"][mb_st:mb_ed],
-                img_ids=inp["img_ids"][mb_st:mb_ed],
-                txt=inp["txt"][mb_st:mb_ed],
-                txt_ids=inp["txt_ids"][mb_st:mb_ed],
-                txt_mask=inp["txt_mask"][mb_st:mb_ed],
-                y=inp["vec"][mb_st:mb_ed],
-                img_mask=inp["img_mask"][mb_st:mb_ed],
-                guidance=guidance[mb_st:mb_ed],
-                height=inp["height"],
-                width=inp["width"],
-                noise=noise[mb_st:mb_ed],
+            denoise_kwargs = dict(
+                img=inp_denoise["img"][mb_st:mb_ed],
+                img_ids=inp_denoise["img_ids"][mb_st:mb_ed],
+                txt=inp_denoise["txt"][mb_st:mb_ed],
+                txt_ids=inp_denoise["txt_ids"][mb_st:mb_ed],
+                txt_mask=inp_denoise["txt_mask"][mb_st:mb_ed],
+                y=inp_denoise["vec"][mb_st:mb_ed],
+                img_mask=inp_denoise["img_mask"][mb_st:mb_ed],
+                height=inp_denoise["height"],
+                width=inp_denoise["width"],
             )
-            
-            # extra_kwargs = dict(
-            #     img_ids=inp["img_ids"][mb_st:mb_ed],
-            #     txt=txt_uncond[mb_st:mb_ed],
-            #     txt_ids=txt_uncond_ids[mb_st:mb_ed],
-            #     txt_mask=txt_uncond_mask[mb_st:mb_ed],
-            #     y=vec_uncond[mb_st:mb_ed],
-            #     img_mask=inp["img_mask"][mb_st:mb_ed],
-            #     drop_mask=inp["drop_mask"][mb_st:mb_ed],
-            #     guidance=torch.full((x_mb.shape[0],), 1.0, device=x_mb.device, dtype=x_mb.dtype),
-            # )
-            
+
             with {
                 "bf16": torch.cuda.amp.autocast(dtype=torch.bfloat16),
                 "fp16": torch.cuda.amp.autocast(dtype=torch.float16),
@@ -689,43 +673,48 @@ def main(args):
                 "tf32": contextlib.nullcontext(),
             }[args.precision]:
                 generator_loss_dict, generator_log_dict = model(
-                    model_kwargs=model_kwargs, 
+                    model_kwargs=denoise_kwargs,
                     generator_turn=True,
                     guidance_turn=False,
                     compute_generator_gradient=COMPUTE_GENERATOR_GRADIENT,
                     visual=visual,
                 )
-                
-            loss_dm = generator_loss_dict["loss_dm"].sum() / data_pack["local_bsz"]
-            gen_cls_loss = generator_loss_dict["gen_cls_loss"].sum() / data_pack["local_bsz"]
-            generator_loss = loss_dm * args.dm_loss_weight + gen_cls_loss * args.gen_cls_loss_weight
-            generator_loss_item += generator_loss.item()
             
-            with model.no_sync() if args.data_parallel in ["sdp"] and not last_mb else contextlib.nullcontext():
-                generator_loss.backward()
-        breakpoint()
-        grad_norm = model.clip_grad_norm_(max_norm=args.grad_clip)
-        opt_generator.step()
-        opt_generator.zero_grad()
-        opt_guidance.zero_grad()
+            accumulated_generator_log_dict = accumulate_log_dict(accumulated_generator_log_dict, generator_log_dict)
+            
+            if COMPUTE_GENERATOR_GRADIENT:
+                loss_dm = generator_loss_dict["loss_dm"].sum() / data_pack["local_bsz"]
+                gen_cls_loss = generator_loss_dict["gen_cls_loss"].sum() / data_pack["local_bsz"]
+                generator_loss = loss_dm * args.dm_loss_weight + gen_cls_loss * args.gen_cls_loss_weight
+                generator_loss_item += generator_loss.item()
+                
+                with model.no_sync() if args.data_parallel in ["sdp"] and not last_mb else contextlib.nullcontext():
+                    generator_loss.backward()
         
+        if COMPUTE_GENERATOR_GRADIENT:
+            generator_grad_norm = model.generator.clip_grad_norm_(max_norm=args.grad_clip)
+            opt_generator.step()
+            opt_generator.zero_grad()
+            opt_guidance.zero_grad()
+        
+        guidance_loss_item = 0.0
         for mb_idx in range((data_pack["local_bsz"] - 1) // data_pack["micro_bsz"] + 1):
             mb_st = mb_idx * data_pack["micro_bsz"]
             mb_ed = min((mb_idx + 1) * data_pack["micro_bsz"], data_pack["local_bsz"])
             last_mb = mb_ed == data_pack["local_bsz"]
             
-            model_kwargs = dict(
-                img=inp["img"][mb_st:mb_ed],
-                img_ids=inp["img_ids"][mb_st:mb_ed],
-                txt=inp["txt"][mb_st:mb_ed],
-                txt_ids=inp["txt_ids"][mb_st:mb_ed],
-                txt_mask=inp["txt_mask"][mb_st:mb_ed],
-                y=inp["vec"][mb_st:mb_ed],
-                img_mask=inp["img_mask"][mb_st:mb_ed],
-                guidance=guidance[mb_st:mb_ed],
-                height=inp["height"],
-                width=inp["width"],
-                noise=noise[mb_st:mb_ed],
+            denoise_kwargs["img"] = accumulated_generator_log_dict["guidance_data_dict"]["img"][mb_st:mb_ed]
+            
+            extra_kwargs = dict(
+                img=inpt_real["img"][mb_st:mb_ed],
+                img_ids=inpt_real["img_ids"][mb_st:mb_ed],
+                txt=inpt_real["txt"][mb_st:mb_ed],
+                txt_ids=inpt_real["txt_ids"][mb_st:mb_ed],
+                txt_mask=inpt_real["txt_mask"][mb_st:mb_ed],
+                y=inpt_real["vec"][mb_st:mb_ed],
+                img_mask=inpt_real["img_mask"][mb_st:mb_ed],
+                height=inpt_real["height"],
+                width=inpt_real["width"],
             )
             
             with {
@@ -734,25 +723,24 @@ def main(args):
                 "fp32": contextlib.nullcontext(),
                 "tf32": contextlib.nullcontext(),
             }[args.precision]:
-                generator_loss_dict, generator_log_dict = data_pack["transport"].training_losses(
-                    model=model, 
-                    guidance_model=guidance_model, 
-                    model_kwargs=model_kwargs, 
+                guidance_loss_dict, guidance_log_dict = model(
+                    model_kwargs=denoise_kwargs, 
+                    extra_kwargs=extra_kwargs,
                     generator_turn=False,
                     guidance_turn=True,
                     compute_generator_gradient=COMPUTE_GENERATOR_GRADIENT,
                     visual=visual,
                 )
                 
-            loss_fake = generator_loss_dict["loss_fake"].sum() / data_pack["local_bsz"]
-            guidance_cls_loss = generator_loss_dict["guidance_cls_loss"].sum() / data_pack["local_bsz"]
+            loss_fake = guidance_loss_dict["loss_fake"].sum() / data_pack["local_bsz"]
+            guidance_cls_loss = guidance_loss_dict["guidance_cls_loss"].sum() / data_pack["local_bsz"]
             guidance_loss = loss_fake * args.guidance_loss_weight + guidance_cls_loss * args.guidance_cls_loss_weight
             guidance_loss_item += guidance_loss.item()
             
             with model.no_sync() if args.data_parallel in ["sdp"] and not last_mb else contextlib.nullcontext():
                 guidance_loss.backward()
 
-        grad_norm = model.clip_grad_norm_(max_norm=args.grad_clip)
+        guidance_grad_norm = model.fake_model.clip_grad_norm_(max_norm=args.grad_clip)
         opt_guidance.step()
         opt_generator.zero_grad()
         opt_guidance.zero_grad()
@@ -761,27 +749,30 @@ def main(args):
         
         if args.use_wandb and rank == 0:
             wandb.log({
-                "train/loss": loss_item,
-                "train/grad_norm": grad_norm,
+                "train/generator_loss": generator_loss_item,
+                "train/guidance_loss": guidance_loss_item,
+                "train/generator_grad_norm": generator_grad_norm,
+                "train/guidance_grad_norm": guidance_grad_norm,
                 "train/generator_lr": opt_generator.param_groups[0]["lr"],
                 "train/guidance_lr": opt_guidance.param_groups[0]["lr"],
             }, step=step)
 
         # Log loss values:
         metrics = data_pack["metrics"]
-        metrics["loss"].update(loss_item)
-        metrics["cfg_loss"].update(cfg_loss_item)
-        metrics["diff_loss"].update(diff_loss_item)
-        metrics["grad_norm"].update(grad_norm)
+        if COMPUTE_GENERATOR_GRADIENT:
+            metrics["generator_loss"].update(generator_loss_item)
+            metrics["generator_grad_norm"].update(generator_grad_norm)
+        metrics["guidance_loss"].update(guidance_loss_item)
+        metrics["guidance_grad_norm"].update(guidance_grad_norm)
         metrics["Secs/Step"].update(end_time - start_time)
         metrics["Imgs/Sec"].update(data_pack["global_bsz"] / (end_time - start_time))
-        metrics["grad_norm"].update(grad_norm)
         if (step + 1) % args.log_every == 0:
             # Measure training speed:
             torch.cuda.synchronize()
             logger.info(
                 f"Res{high_res}: (step{step + 1:07d}) "
-                + f"lr{opt.param_groups[0]['lr']:.6f} "
+                + f"generator_lr{opt_generator.param_groups[0]['lr']:.8f} "
+                + f"guidance_lr{opt_guidance.param_groups[0]['lr']:.8f} "
                 + " ".join([f"{key}:{str(val)}" for key, val in metrics.items()])
             )
 
@@ -799,10 +790,10 @@ def main(args):
                 StateDictType.FULL_STATE_DICT,
                 FullStateDictConfig(rank0_only=True, offload_to_cpu=True),
             ):
-                consolidated_model_state_dict = model.state_dict()
+                consolidated_model_state_dict = model.generator.state_dict()
                 if fs_init.get_data_parallel_rank() == 0:
                     consolidated_fn = (
-                        "consolidated."
+                        "generator_consolidated."
                         f"{fs_init.get_model_parallel_rank():02d}-of-"
                         f"{fs_init.get_model_parallel_world_size():02d}"
                         ".pth"
@@ -811,6 +802,17 @@ def main(args):
                         consolidated_model_state_dict,
                         os.path.join(checkpoint_path, consolidated_fn),
                     )
+                
+                consolidated_model_state_dict = model.fake_model.state_dict()
+                if fs_init.get_data_parallel_rank() == 0:
+                    consolidated_fn = (
+                        "fake_model_consolidated."
+                        f"{fs_init.get_model_parallel_rank():02d}-of-"
+                        f"{fs_init.get_model_parallel_world_size():02d}"
+                        ".pth"
+                    )
+                    torch.save(consolidated_model_state_dict, os.path.join(checkpoint_path, consolidated_fn))
+                    
             dist.barrier()
             del consolidated_model_state_dict
             logger.info(f"Saved consolidated to {checkpoint_path}.")
@@ -840,8 +842,11 @@ def main(args):
                 model,
                 StateDictType.LOCAL_STATE_DICT,
             ):
-                opt_state_fn = f"optimizer.{dist.get_rank():05d}-of-" f"{dist.get_world_size():05d}.pth"
-                torch.save(opt.state_dict(), os.path.join(checkpoint_path, opt_state_fn))
+                opt_state_fn = f"generator_optimizer.{dist.get_rank():05d}-of-" f"{dist.get_world_size():05d}.pth"
+                torch.save(opt_generator.state_dict(), os.path.join(checkpoint_path, opt_state_fn))
+                
+                opt_state_fn = f"fake_model_optimizer.{dist.get_rank():05d}-of-" f"{dist.get_world_size():05d}.pth"
+                torch.save(opt_guidance.state_dict(), os.path.join(checkpoint_path, opt_state_fn))
             dist.barrier()
             logger.info(f"Saved optimizer to {checkpoint_path}.")
 
@@ -925,12 +930,6 @@ if __name__ == "__main__":
         help="Do dynamic time shifting",
     )
     parser.add_argument(
-        "--low_res_list",
-        type=str,
-        default="256,512,1024",
-        help="Comma-separated list of low resolution for training."
-    )
-    parser.add_argument(
         "--high_res_list",
         type=str,
         default="1024,2048,4096",
@@ -942,24 +941,24 @@ if __name__ == "__main__":
         default="0.2,0.7,0.1",
         help="Comma-separated list of probabilities for sampling high resolution images."
     )
-    parser.add_argument(
-        "--low_res_probs",
-        type=str,
-        default="0.2,0.7,0.1",
-        help="Comma-separated list of probabilities for sampling low resolution images."
-    )
+    parser.add_argument("--generator_loss_type", type=str, default="dmd")
+    parser.add_argument("--generator_guidance_scale", type=float, default=1.0)
+    parser.add_argument("--real_guidance_scale", type=float, default=1.0)
+    parser.add_argument("--fake_guidance_scale", type=float, default=1.0)
+    parser.add_argument("--min_step_percent", type=float, default=0.02)
+    parser.add_argument("--max_step_percent", type=float, default=0.98)
     parser.add_argument("--visual_every", type=int, default=100)
     parser.add_argument("--grid_size", type=int, default=2)
+    parser.add_argument("--num_denoising_step", type=int, default=1)
+    parser.add_argument("--guidance_loss_weight", type=float, default=1.0)
+    parser.add_argument("--guidance_cls_loss_weight", type=float, default=1.0)
     parser.add_argument("--dm_loss_weight", type=float, default=1.0)
     parser.add_argument("--gen_cls_loss_weight", type=float, default=1.0)
     parser.add_argument("--num_discriminator_heads", type=int, default=0)
     parser.add_argument("--dfake_gen_update_ratio", type=int, default=1)
     parser.add_argument("--full_model", action="store_true")
     parser.add_argument("--use_wandb", action="store_true")
-    parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
-    args.low_res_list = [int(res) for res in args.low_res_list.split(",")]
     args.high_res_list = [int(res) for res in args.high_res_list.split(",")]
     args.high_res_probs = [float(prob) for prob in args.high_res_probs.split(",")]
-    args.low_res_probs = [float(prob) for prob in args.low_res_probs.split(",")]
     main(args)

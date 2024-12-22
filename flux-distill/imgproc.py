@@ -221,12 +221,11 @@ def pad(pil_image, pad_size):
     return new_image
 
 
-def var_center_crop(pil_image, crop_size_list, random_top_k=4):
+def var_center_crop(pil_image, crop_size_dict):
     w, h = pil_image.size
-    rem_percent = [min(cw / w, ch / h) / max(cw / w, ch / h) for cw, ch in crop_size_list]
-    crop_size = random.choice(
-        sorted(((x, y) for x, y in zip(rem_percent, crop_size_list)), reverse=True)[:random_top_k]
-    )[1]
+    ratio_list = crop_size_dict.keys()
+    rem_percent = min(ratio_list, key=lambda r: abs(float(r) - float(h) / float(w)))
+    crop_size = crop_size_dict[rem_percent][::-1]  # Reverse h,w to w,h
     return center_crop(pil_image, crop_size)
 
 

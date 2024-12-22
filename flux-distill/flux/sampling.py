@@ -31,79 +31,46 @@ def get_noise(
     )
 
 
-def prepare(t5: HFEmbedder, clip: HFEmbedder, img: Tensor, prompt: str | list[str], img_cond: Tensor = None, proportion_empty_prompts: float = 0.1, proportion_empty_images: float = 0.3, is_train: bool = True, text_emb: list[dict[str, Tensor]] = None) -> dict[str, Tensor]:
-    height, width = img[0].shape[-2:]
-    height, width = height // 2, width // 2
-    if isinstance(img, torch.Tensor):
+def prepare(t5: HFEmbedder, clip: HFEmbedder, img: Tensor, prompt: str | list[str], proportion_empty_prompts: float = 0.1, proportion_empty_images: float = 0.3, is_train: bool = True, text_emb: list[dict[str, Tensor]] = None) -> dict[str, Tensor]:
+    if img is None:
+        img = None
+        img_ids = None
+        img_mask = None
+        height, width = 0, 0
+    elif isinstance(img, torch.Tensor):
         bs, c, h, w = img.shape
+        height, width = h // 2, w // 2
         img = rearrange(img, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2)
         if img.shape[0] == 1 and bs > 1:
             img = repeat(img, "1 ... -> bs ...", bs=bs)
         img_ids = torch.zeros(h // 2, w // 2, 3)
         img_ids[..., 1] = img_ids[..., 1] + torch.arange(h // 2)[:, None]
         img_ids[..., 2] = img_ids[..., 2] + torch.arange(w // 2)[None, :]
-        img_ids = repeat(img_ids, "h w c -> b (h w) c", b=bs)
+        img_ids = repeat(img_ids, "h w c -> b (h w) c", b=bs).to(img.device)
         img_mask = torch.ones(bs, img.shape[1], device=img.device, dtype=torch.int32)
-
-        if img_cond is not None:
-            _, _, h_cond, w_cond = img_cond.shape
-            down_factor = h // h_cond
-            img_cond = rearrange(img_cond, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2)
-            if img_cond.shape[0] == 1 and bs > 1:
-                img_cond = repeat(img_cond, "1 ... -> bs ...", bs=bs)
-            img_cond_ids = torch.zeros(h_cond // 2, w_cond // 2, 3)
-            img_cond_ids[..., 0] = -1
-            img_cond_ids[..., 1] = img_cond_ids[..., 1] + (torch.arange(h_cond // 2)[:, None] * down_factor + down_factor / 2 - 0.5)
-            img_cond_ids[..., 2] = img_cond_ids[..., 2] + (torch.arange(w_cond // 2)[None, :] * down_factor + down_factor / 2 - 0.5)
-            img_cond_ids = repeat(img_cond_ids, "h w c -> b (h w) c", b=bs)
-            img_cond_mask = torch.ones(bs, img_cond.shape[1], device=img_cond.device, dtype=torch.int32) 
-        # TODO: check this
-        
     else:
         bs = len(img)
+        height, width = img[0].shape[-2:]
+        height, width = height // 2, width // 2
         max_len = max([i.shape[-2] * i.shape[-1] for i in img]) // 4
         # pad img to same length for batch processing
         img_mask = torch.zeros(bs, max_len, device=img[0].device, dtype=torch.int32)
         padded_img = []
         padded_img_ids = []
-        if img_cond is not None:
-            max_len_cond = max([i.shape[-2] * i.shape[-1] for i in img_cond]) // 4
-            img_cond_mask = torch.zeros(bs, max_len_cond, device=img_cond[0].device, dtype=torch.int32)
-            padded_img_cond = []
-            padded_img_cond_ids = []
         for i in range(bs):
             img_i = img[i].squeeze(0)
             c, h, w = img_i.shape
-        
             img_ids = torch.zeros(h // 2, w // 2, 3)
             img_ids[..., 1] = img_ids[..., 1] + torch.arange(h // 2)[:, None]
             img_ids[..., 2] = img_ids[..., 2] + torch.arange(w // 2)[None, :]
-            
             flat_img_ids = rearrange(img_ids, "h w c -> (h w) c")
             flat_img = rearrange(img_i, "c (h ph) (w pw) -> (h w) (c ph pw)", ph=2, pw=2)
-            
             padded_img.append(F.pad(flat_img, (0, 0, 0, max_len - flat_img.shape[0])))
             padded_img_ids.append(F.pad(flat_img_ids, (0, 0, 0, max_len - flat_img_ids.shape[0])))
-            
             img_mask[i, :flat_img.shape[0]] = 1
-
-            if img_cond is not None:
-                _, h_cond, w_cond = img_cond_i.shape
-                down_factor = h // h_cond
-                img_cond_ids = torch.zeros(h_cond // 2, w_cond // 2, 3)
-                img_cond_ids[..., 0] = -1
-                img_cond_ids[..., 1] = img_cond_ids[..., 1] + (torch.arange(h_cond // 2)[:, None] * down_factor + down_factor / 2 - 0.5)
-                img_cond_ids[..., 2] = img_cond_ids[..., 2] + (torch.arange(w_cond // 2)[None, :] * down_factor + down_factor / 2 - 0.5)
-                flat_img_cond_ids = rearrange(img_cond_ids, "h w c -> (h w) c")
-                flat_img_cond = rearrange(img_cond_i, "c (h ph) (w pw) -> (h w) (c ph pw)", ph=2, pw=2)
-                padded_img_cond.append(F.pad(flat_img_cond, (0, 0, 0, max_len_cond - flat_img_cond.shape[0])))
-                padded_img_cond_ids.append(F.pad(flat_img_cond_ids, (0, 0, 0, max_len_cond - flat_img_cond_ids.shape[0])))
-                img_cond_mask[i, :flat_img_cond.shape[0]] = 1
         img = torch.stack(padded_img, dim=0)
-        img_ids = torch.stack(padded_img_ids, dim=0)
-        if img_cond is not None:
-            img_cond = torch.stack(padded_img_cond, dim=0)
-            img_cond_ids = torch.stack(padded_img_cond_ids, dim=0)
+        img_ids = torch.stack(padded_img_ids, dim=0).to(img.device)
+        
         
     if isinstance(prompt, str):
         prompt = [prompt]
@@ -119,8 +86,6 @@ def prepare(t5: HFEmbedder, clip: HFEmbedder, img: Tensor, prompt: str | list[st
             drop_mask.append(0)
         else:
             drop_mask.append(1)
-        if img_cond is not None and random.random() < proportion_empty_images:
-            img_cond[idx].zero_()
     drop_mask = torch.tensor(drop_mask, device=img_mask.device, dtype=img_mask.dtype)
     
     if t5 is None:
@@ -141,20 +106,16 @@ def prepare(t5: HFEmbedder, clip: HFEmbedder, img: Tensor, prompt: str | list[st
 
     out_dict = {
         "img": img,
-        "img_ids": img_ids.to(img.device),
+        "img_ids": img_ids,
         "txt": txt.to(img.device),
         "txt_ids": txt_ids.to(img.device),
         "vec": vec.to(img.device),
-        "img_mask": img_mask.to(img.device),
-        "txt_mask": txt_mask.to(txt.device),
+        "img_mask": img_mask,
+        "txt_mask": txt_mask.to(img.device),
         "drop_mask": drop_mask.to(img.device),
         "height": height,
         "width": width,
     }
-    if img_cond is not None:
-        out_dict["img_cond"] = img_cond
-        out_dict["img_cond_ids"] = img_cond_ids.to(img.device)
-        out_dict["img_cond_mask"] = img_cond_mask.to(img.device)
 
     return out_dict
 

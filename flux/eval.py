@@ -13,7 +13,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Image Quality Assessment using PyIQA')
     parser.add_argument(
         '--root_dir',
-        default='//data/zl/DiffEntropy/flux/samples/eval/lq250_v3_with_single_control_redux_tiled_multi_degradation_train_wo_noise_wo_usm_0040000_gate_1.0_1.0_cfg_2.0_1.0_image_prompt/',
+        default='/ceph/data-bk/zl/DiffEntropy/flux/samples/eval/lq250_v3_with_single_control_redux_tiled_multi_degradation_train_wo_noise_wo_usm_0040000_gate_1.0_1.0_cfg_2.0_1.0_image_prompt/',
         help='根目录，包含多个子文件夹',
     )
     parser.add_argument('--is_root_dir', action='store_true', help='是否是根目录')

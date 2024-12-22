@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 
 export HF_TOKEN="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"
-export HF_HOME="/data/huggingface"
+export HF_HOME="/ceph/data-bk/huggingface"
 
 # Lumina-Next supports any resolution (up to 2K)
 res="1024:1024x1024"

@@ -41,6 +41,6 @@ def update_json_with_aspect_ratio(input_file, output_file):
         json.dump(data, f, indent=2)
 
 # Example usage
-input_file = '/data/zl/DiffEntropy/krea_2M_full_filtered.json'
-output_file = '/data/zl/DiffEntropy/krea_2M_full_bucket.json'
+input_file = '/ceph/data-bk/zl/DiffEntropy/krea_2M_full_filtered.json'
+output_file = '/ceph/data-bk/zl/DiffEntropy/krea_2M_full_bucket.json'
 update_json_with_aspect_ratio(input_file, output_file)

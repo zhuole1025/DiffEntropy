@@ -4,8 +4,11 @@ from typing import List
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
+from diffusers import AutoencoderKL
+from einops import rearrange
 
-from .modules.layers import DoubleStreamBlock, EmbedND, LastLayer, MLPEmbedder, SingleStreamBlock, timestep_embedding, ControlNetGate, DiscriminatorHead
+from .modules.layers import DoubleStreamBlock, EmbedND, LastLayer, MLPEmbedder, SingleStreamBlock, timestep_embedding
+from .modules.discriminator import DiscriminatorHead
 from flux.modules.lora import LinearLora, replace_linear_with_lora
 from transport.utils import mean_flat, time_shift, get_lin_function, expand_t_like_x
 
@@ -134,19 +137,18 @@ class Flux(nn.Module):
         
         img = torch.cat((txt, img), 1)
         attn_mask = torch.cat((txt_mask, img_mask), 1)
-        # single_blocks_out = []
-        for block in self.single_blocks:
+        single_blocks_out = []
+        for idx, block in enumerate(self.single_blocks):
             img, sub_token_select, token_logits = block(img, vec=vec, pe=pe, attn_mask=attn_mask)
-            # if classify_mode:
-                # single_blocks_out.append(img[:, txt.shape[1] :, ...])
+            if classify_mode:
+                single_blocks_out.append(img[:, txt.shape[1] :, ...])
         
         if classify_mode:
             outputs = []
-            all_blocks_out = double_blocks_out
+            all_blocks_out = single_blocks_out
             for feature, head in zip(all_blocks_out, self.discriminator):
-                feature = feature.permute(0, 2, 1).reshape(feature.shape[0], -1, height, width)
-                outputs.append(head(feature))
-            outputs = torch.cat(outputs, dim=1) # (N, num_heads, H * W)
+                outputs.append(head(feature).reshape(feature.shape[0], -1))
+            outputs = torch.cat(outputs, dim=1)
             return outputs
         
         img = img[:, txt.shape[1] :, ...]
@@ -244,32 +246,67 @@ class FluxLoraWrapper(Flux):
                 
 
 class FluxUnifiedWrapper(nn.Module):
-    def __init__(self, params: FluxParams, num_discriminator_heads: int = 0, dtype: torch.dtype = torch.bfloat16, snr_type: str = "uniform", do_shift: bool = False, grid_size: int = 1):
+    def __init__(self, params: FluxParams, num_discriminator_heads: int = 0, dtype: torch.dtype = torch.bfloat16, snr_type: str = "uniform", do_shift: bool = False, grid_size: int = 1, device: str = "cuda", offload_to_cpu: bool = False, vae: AutoencoderKL = None, num_denoising_step: int = 1, min_step_percent: float = 0.02, max_step_percent: float = 0.98, real_guidance_scale: float = 1.0, fake_guidance_scale: float = 1.0, generator_guidance_scale: float = 1.0, generator_loss_type: str = "dmd"):
         super().__init__()
+        with torch.device(device):
+            self.fake_model = Flux(params=params, num_discriminator_heads=num_discriminator_heads).to(dtype)
+            torch.cuda.empty_cache()
+        if offload_to_cpu:
+            self.fake_model.to_empty(device="cpu")
+        with torch.device(device):
+            self.real_model = Flux(params=params, num_discriminator_heads=0).to(dtype)
+            torch.cuda.empty_cache()
+        if offload_to_cpu:
+            self.real_model.to_empty(device="cpu")
+        with torch.device(device):
+            self.generator = Flux(params=params, num_discriminator_heads=0).to(dtype)
+            torch.cuda.empty_cache()
+        if offload_to_cpu:
+            self.generator.to_empty(device="cpu")
         
-        self.guidance = FluxLoraWrapper(params=params, num_discriminator_heads=num_discriminator_heads).to(dtype)
-        torch.cuda.empty_cache()
-        self.generator = Flux(params=params, num_discriminator_heads=0).to(dtype)
-        torch.cuda.empty_cache()
-        
+        self.vae = vae
         self.snr_type = snr_type
         self.do_shift = do_shift
-        self.grid_size = grid_size
+        self.num_visuals = grid_size * grid_size
+        self.num_denoising_step = num_denoising_step
+        self.denoising_step_list = torch.tensor(
+            [0, 1, 1 / self.num_denoising_step],
+            device=device
+        )
+        self.phuber_c = 0.03
+        self.generator_loss_type = generator_loss_type
+        self.min_step_percent = min_step_percent
+        self.max_step_percent = max_step_percent
+        self.real_guidance_scale = real_guidance_scale
+        self.fake_guidance_scale = fake_guidance_scale
+        self.generator_guidance_scale = generator_guidance_scale
+        self.real_guidance = torch.full((1,), self.real_guidance_scale, device=device)
+        self.fake_guidance = torch.full((1,), self.fake_guidance_scale, device=device)
+        self.generator_guidance = torch.full((1,), self.generator_guidance_scale, device=device)
+            
+    def load_state_dict(self, state_dict: dict):
+        self.fake_model.load_state_dict(state_dict, strict=False, assign=True)
+        self.real_model.load_state_dict(state_dict, strict=True, assign=True)
+        self.generator.load_state_dict(state_dict, strict=True, assign=True)
+        
+        # initialize the weight of the discriminator
+        for head in self.fake_model.discriminator:
+            for name, param in head.named_parameters():
+                if name.endswith(".weight"):
+                    nn.init.kaiming_normal_(param)
+                elif name.endswith(".bias"):
+                    nn.init.zeros_(param)
+            
+    def decode_image(self, latents):
+        latents = 1 / self.vae.config.scaling_factor * latents + self.vae.config.shift_factor
+        image = self.vae.decode(latents).sample.float()
+        return image 
     
-    def load_state_dict(self, guidance_state_dict: dict, generator_state_dict: dict):
-        self.guidance.load_state_dict(guidance_state_dict, strict=False, assign=True)
-        self.generator.load_state_dict(generator_state_dict, strict=False, assign=True)
+    def unpack(self, latents, height, width):
+        latents = rearrange(latents, 'b (h w) (c ph pw) -> b c (h ph) (w pw)', h=height, w=width, ph=2, pw=2)
+        return latents
     
-    def parameter_count(self) -> tuple[int, int]:
-        return self.guidance.parameter_count(), self.generator.parameter_count()
-    
-    def get_fsdp_wrap_module_list(self) -> List[nn.Module]:
-        return self.guidance.get_fsdp_wrap_module_list() + self.generator.get_fsdp_wrap_module_list()
-
-    def get_checkpointing_wrap_module_list(self) -> List[nn.Module]:
-        return self.guidance.get_checkpointing_wrap_module_list() + self.generator.get_checkpointing_wrap_module_list()
-    
-    def sample(self, x1, x0=None, snr_type=None):
+    def sample(self, x1, x0=None, snr_type=None, t0=0.0, t1=1.0):
         """Sampling x0 & t based on shape of x1 (if needed)
         Args:
           x1 - data point; [batch, *dim]
@@ -280,7 +317,6 @@ class FluxUnifiedWrapper(nn.Module):
             x0 = [th.randn_like(img_start) for img_start in x1]
         else:
             x0 = torch.randn_like(x1)
-        t0, t1 = 0.0, 1.0
 
         if snr_type is None:
             snr_type = self.snr_type
@@ -299,6 +335,9 @@ class FluxUnifiedWrapper(nn.Module):
         elif snr_type == "lognorm":
             u = torch.normal(mean=0.0, std=1.0, size=(len(x1),))
             t = 1 / (1 + torch.exp(-u)) * (t1 - t0) + t0
+        elif snr_type == "grid":
+            indices = torch.randint(0, self.num_denoising_step, (len(x1),))
+            t = self.denoising_step_list[indices]
         else:
             raise NotImplementedError("Not implemented snr_type %s" % snr_type)
 
@@ -311,33 +350,39 @@ class FluxUnifiedWrapper(nn.Module):
         t = t.to(x1[0])
         return t, x0, x1
     
-    def compute_distribution_matching_loss(self, x1, x0=None, model_kwargs=None):
+    def compute_distribution_matching_loss(self, x1, model_kwargs=None):
         original_x1 = x1 
         with torch.no_grad():
-            t, x0, x1 = self.sample(x1, x0)
+            t, x0, x1 = self.sample(x1, t0=self.min_step_percent, t1=self.max_step_percent)
             t_expanded = expand_t_like_x(t, x1)
             xt = (1 - t_expanded) * x0 + t_expanded * x1
-            ut = x1 - x0
             
             # fake score
-            self.guidance.set_lora_scale(1.0)
-            out_dict = self.guidance(xt, timesteps=1 - t, **model_kwargs)
+            fake_guidance = self.fake_guidance.repeat(len(x1)).to(x1.device, x1.dtype)
+            out_dict = self.fake_model(xt, timesteps=1 - t, guidance=fake_guidance, **model_kwargs)
             model_output = -out_dict["output"]  
             pred_fake_image = xt + model_output * (1 - t_expanded)
 
             # real score
-            self.guidance.set_lora_scale(0.0)
-            out_dict = self.guidance(xt, timesteps=1 - t, **model_kwargs)
+            real_guidance = self.real_guidance.repeat(len(x1)).to(x1.device, x1.dtype)
+            out_dict = self.real_model(xt, timesteps=1 - t, guidance=real_guidance, **model_kwargs)
             model_output = -out_dict["output"]  
             pred_real_image = xt + model_output * (1 - t_expanded)
 
-            p_real = (x1 - pred_real_image)
-            p_fake = (x1 - pred_fake_image)
-
+        p_real = (x1 - pred_real_image)
+        p_fake = (x1 - pred_fake_image)
+        
+        if self.generator_loss_type == "dmd":
             grad = (p_real - p_fake) / torch.abs(p_real).mean(dim=[1, 2], keepdim=True) 
             grad = torch.nan_to_num(grad)
-            
-        loss = 0.5 * F.mse_loss(original_x1.float(), (original_x1 - grad).detach().float(), reduction="mean")
+            loss = 0.5 * F.mse_loss(original_x1.float(), (original_x1 - grad).detach().float(), reduction="mean")
+        elif self.generator_loss_type == "sim":
+            grad = p_real - p_fake
+            grad = torch.nan_to_num(grad)
+            normed_grad = torch.sqrt((grad.square().sum(dim=[1, 2], keepdim=True) + self.phuber_c ** 2))
+            loss = grad * (p_fake - original_x1) / normed_grad
+        else:
+            raise NotImplementedError("Not implemented generator_loss_type %s" % self.generator_loss_type)
         
         loss_dict = {
             "loss_dm": loss 
@@ -353,26 +398,25 @@ class FluxUnifiedWrapper(nn.Module):
 
         return loss_dict, dm_log_dict
     
-    def compute_cls_logits(self, x1, x0=None, model_kwargs=None):
-        t, x0, x1 = self.sample(x1, x0)
+    def compute_cls_logits(self, x1, model_kwargs=None):
+        t, x0, x1 = self.sample(x1)
         t_expanded = expand_t_like_x(t, x1)
         xt = (1 - t_expanded) * x0 + t_expanded * x1
         ut = x1 - x0
-        self.guidance.set_lora_scale(1.0)
-        logits = self.guidance(xt, timesteps=1 - t, classify_mode=True, **model_kwargs)
+        fake_guidance = self.fake_guidance.repeat(len(x1)).to(x1.device, x1.dtype)
+        logits = self.fake_model(xt, timesteps=1 - t, guidance=fake_guidance, classify_mode=True, **model_kwargs)
         return logits
 
-    def compute_generator_clean_cls_loss(self, 
-        x1, x0=None, model_kwargs=None
-    ):
-        logits = self.compute_cls_logits(x1, x0, model_kwargs)
+    def compute_generator_clean_cls_loss(self, x1, model_kwargs=None):
+        with torch.no_grad():
+            logits = self.compute_cls_logits(x1, model_kwargs)
         loss_dict = {}
         loss_dict["gen_cls_loss"] = mean_flat(F.softplus(-logits))
         return loss_dict 
     
-    def compute_guidance_clean_cls_loss(self, real_image, fake_image, x0=None, model_kwargs=None):
-        pred_realism_on_real = self.compute_cls_logits(real_image.detach(), x0, model_kwargs)
-        pred_realis_on_fake = self.compute_cls_logits(fake_image.detach(), x0, model_kwargs)
+    def compute_guidance_clean_cls_loss(self, real_image, fake_image, real_kwargs=None, fake_kwargs=None):
+        pred_realism_on_real = self.compute_cls_logits(real_image.detach(), model_kwargs=real_kwargs)
+        pred_realism_on_fake = self.compute_cls_logits(fake_image.detach(), model_kwargs=fake_kwargs)
         
         log_dict = {
             "pred_realism_on_real": mean_flat(torch.sigmoid(pred_realism_on_real).detach()),
@@ -386,111 +430,108 @@ class FluxUnifiedWrapper(nn.Module):
         return loss_dict, log_dict 
         
     
-    def compute_loss_fake(self, x1, x0=None, model_kwargs=None):
-        t, x0, x1 = self.sample(x1.detach(), x0)
+    def compute_loss_fake(self, x1, model_kwargs=None):
+        t, x0, x1 = self.sample(x1.detach())
         t_expanded = expand_t_like_x(t, x1)
         xt = (1 - t_expanded) * x0 + t_expanded * x1
         ut = x1 - x0
             
-        self.guidance.set_lora_scale(0.0)
-        model_kwargs['guidance'] = torch.ones_like(model_kwargs['guidance'], device=x1.device, dtype=x1.dtype)
-        out_dict = self.guidance(xt, timesteps=1 - t, **model_kwargs)
+        fake_guidance = self.fake_guidance.repeat(len(x1)).to(x1.device, x1.dtype)
+        out_dict = self.fake_model(xt, timesteps=1 - t, guidance=fake_guidance, **model_kwargs)
         model_output = -out_dict["output"]
         pred_fake_image = xt + model_output * (1 - t_expanded)
         loss_fake = mean_flat(((model_output - ut) ** 2))
         loss_dict = {
-            "loss_fake_mean": loss_fake,
+            "loss_fake": loss_fake,
         }
         fake_log_dict = {
-            "faketrain_latents": latents.detach().float(),
-            "faketrain_noisy_latents": noisy_latents.detach().float(),
-            "faketrain_x0_pred": fake_x0_pred.detach().float()
+            "faketrain_latents": x1.detach().float(),
+            "faketrain_noisy_latents": xt.detach().float(),
+            "faketrain_x0_pred": pred_fake_image.detach().float()
         }
         
         return loss_dict, fake_log_dict
     
-    def forward(self, model_kwargs: dict, generator_turn: bool = False, guidance_turn: bool = False, compute_generator_gradient: bool = True, visual: bool = False):
+    def forward(self, model_kwargs: dict, extra_kwargs: dict = None, generator_turn: bool = False, guidance_turn: bool = False, compute_generator_gradient: bool = True, visual: bool = False):
         loss_dict = {}
         log_dict = {}
         
-        # generator_turn:
+        assert (generator_turn and not guidance_turn) or (guidance_turn and not generator_turn)
+        
         if generator_turn:
             height, width = model_kwargs['height'], model_kwargs['width']
             
             # prepare noisy data using forward diffusion
             x1 = model_kwargs.pop('img')
-            x0 = model_kwargs.pop('noise')
-            t, x0, x1 = self.sample(x1, x0)
+            t, x0, x1 = self.sample(x1, snr_type="grid")
             t_expanded = expand_t_like_x(t, x1)
             xt = (1 - t_expanded) * x0 + t_expanded * x1
-            ut = x1 - x0
-            
+            guidance = self.generator_guidance.repeat(len(x1)).to(x1.device, x1.dtype)
             if compute_generator_gradient:
-                out_dict = self.generator(xt, timesteps=1 - t, **model_kwargs)
+                out_dict = self.generator(xt, timesteps=1 - t, guidance=guidance, **model_kwargs)
                 model_output = -out_dict["output"]  
             else:
                 with torch.no_grad():
-                    out_dict = self.generator(xt, timesteps=1 - t, **model_kwargs)
+                    out_dict = self.generator(xt, timesteps=1 - t, guidance=guidance, **model_kwargs)
                     model_output = -out_dict["output"]  
                 
             generated_image = xt + model_output * (1 - t_expanded)
             if compute_generator_gradient:
-                self.guidance.requires_grad_(False)
-                dm_dict, dm_log_dict = self.compute_distribution_matching_loss(generated_image, x0, model_kwargs)
+                dm_dict, dm_log_dict = self.compute_distribution_matching_loss(generated_image, model_kwargs)
                 loss_dict.update(dm_dict)
                 log_dict.update(dm_log_dict)
                 
-                cls_loss_dict = self.compute_generator_clean_cls_loss(generated_image, x0, model_kwargs)
+                cls_loss_dict = self.compute_generator_clean_cls_loss(generated_image, model_kwargs)
                 loss_dict.update(cls_loss_dict)
-                self.guidance.requires_grad_(True)
             else:
                 loss_dict = {}
                 log_dict = {}
         
-            # if visual:
-            #     decode_key = [
-            #         "dmtrain_pred_real_image", "dmtrain_pred_fake_image"
-            #     ]
+            if visual:
+                decode_key = [
+                    "dmtrain_pred_real_image", "dmtrain_pred_fake_image"
+                ]
 
-            #     with torch.no_grad():
-            #         if compute_generator_gradient:
-            #             for key in decode_key:
-            #                 latents = log_dict[key].detach()[:self.num_visuals]
-            #                 latents = self.unpack(latents, height, width)
-            #                 log_dict[key+"_decoded"] = self.decode_image(latents) 
+                with torch.no_grad():
+                    if compute_generator_gradient:
+                        for key in decode_key:
+                            latents = log_dict[key].detach()[:self.num_visuals]
+                            latents = self.unpack(latents, height, width)
+                            log_dict[key+"_decoded"] = self.decode_image(latents) 
                     
-            #         latents = generated_image[:self.num_visuals].detach()
-            #         latents = self.unpack(latents, height, width)
-            #         log_dict["generated_image"] = self.decode_image(latents)
+                    latents = generated_image[:self.num_visuals].detach()
+                    latents = self.unpack(latents, height, width)
+                    log_dict["generated_image"] = self.decode_image(latents)
 
-            #         latents = x1[:self.num_visuals].detach()
-            #         latents = self.unpack(latents, height, width)
-            #         log_dict["original_clean_image"] = self.decode_image(latents)
+                    latents = x1[:self.num_visuals].detach()
+                    latents = self.unpack(latents, height, width)
+                    log_dict["original_clean_image"] = self.decode_image(latents)
 
-            # log_dict["guidance_data_dict"] = {
-            #     "image": generated_image.detach(),
-            #     # "text_embedding": text_embedding.detach(),
-            #     # "pooled_text_embedding": pooled_text_embedding.detach(),
-            #     # "uncond_embedding": uncond_embedding.detach(),
-            #     # "real_train_dict": real_train_dict,
-            #     # "unet_added_conditions": unet_added_conditions,
-            #     # "uncond_unet_added_conditions": uncond_unet_added_conditions
-            # }
+            log_dict["guidance_data_dict"] = {
+                "img": generated_image.detach(),
+                # "text_embedding": text_embedding.detach(),
+                # "pooled_text_embedding": pooled_text_embedding.detach(),
+                # "uncond_embedding": uncond_embedding.detach(),
+                # "real_train_dict": real_train_dict,
+                # "unet_added_conditions": unet_added_conditions,
+                # "uncond_unet_added_conditions": uncond_unet_added_conditions
+            }
 
-            # log_dict['denoising_timestep'] = t
+            log_dict['denoising_timestep'] = t
 
-        # guidance turn
-        if guidance_turn:
+        elif guidance_turn:
+            real_image = extra_kwargs.pop('img')
             generated_image = model_kwargs.pop('img')
-            x0 = model_kwargs.pop('noise')
-            fake_dict, fake_log_dict = self.compute_loss_fake(generated_image, x0, model_kwargs)
+            fake_dict, fake_log_dict = self.compute_loss_fake(generated_image, model_kwargs)
             
             loss_dict = fake_dict 
             log_dict = fake_log_dict
-
+            
             clean_cls_loss_dict, clean_cls_log_dict = self.compute_guidance_clean_cls_loss(
-                real_image=real_train_dictreal_image.detach(),
-                fake_image=generated_image
+                real_image=real_image,
+                fake_image=generated_image,
+                real_kwargs=extra_kwargs,
+                fake_kwargs=model_kwargs
             )
             
             loss_dict.update(clean_cls_loss_dict)

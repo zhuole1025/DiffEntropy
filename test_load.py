@@ -5,7 +5,7 @@ def download_stablesr_testsets():
     local_dir = snapshot_download(
         repo_id="Iceclear/StableSR-TestSets",
         repo_type="dataset",
-        local_dir="/data/zl/datasets/StableSR-TestSets",  # Local directory to save the dataset
+        local_dir="/ceph/data-bk/zl/datasets/StableSR-TestSets",  # Local directory to save the dataset
         local_dir_use_symlinks=False  # Download actual files instead of symlinks
     )
     print(f"Dataset downloaded to: {local_dir}")

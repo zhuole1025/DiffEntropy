@@ -2,7 +2,7 @@
 
 export WANDB_API_KEY="75de1215548653cdc8084ae0d1450f2d84fd9a20"
 export HF_TOKEN="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"
-export HF_HOME="/data/huggingface"
+export HF_HOME="/ceph/data-bk/huggingface"
 
 train_data_root='configs/data/2M.yaml'
 batch_size=32

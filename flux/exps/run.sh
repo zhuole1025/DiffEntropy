@@ -5,8 +5,8 @@ export HF_TOKEN="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"
 export HF_HOME="/ceph/data-bk/huggingface"
 
 train_data_root='configs/data/2M.yaml'
-batch_size=256
-micro_batch_size=8
+batch_size=8
+micro_batch_size=1
 lr=1e-5
 precision=bf16
 low_res_list=256
@@ -21,11 +21,11 @@ double_depth=2
 single_depth=4
 backbone_depth=19
 backbone_depth_single=38
-img_embedder_path='/data/huggingface/hub/models--black-forest-labs--FLUX.1-Redux-dev/snapshots/1282f955f706b5240161278f2ef261d2a29ad649/flux1-redux-dev.safetensors'
+img_embedder_path='/ceph/data-bk/zl/ckpts/flux1-redux-dev.safetensors'
 
-exp_name=${high_res_list}_${high_res_probs}_${low_res_list}_${low_res_probs}_depth_${double_depth}_${single_depth}_${backbone_depth}_${backbone_depth_single}_snr_${snr_type}_${controlnet_snr}_cfg_${backbone_cfg}_${controlnet_cfg}_bsz_${batch_size}_wo_shift_lr_${lr}_cap_redux_only_tiled_multi_degradation_wo_noise_wo_usm
+exp_name=${high_res_list}_${high_res_probs}_${low_res_list}_${low_res_probs}_depth_${double_depth}_${single_depth}_${backbone_depth}_${backbone_depth_single}_snr_${snr_type}_${controlnet_snr}_cfg_${backbone_cfg}_${controlnet_cfg}_bsz_${batch_size}_wo_shift_lr_${lr}_cap_redux_only_tiled_multi_degradation_wo_noise_wo_usm_fix
 # exp_name=learnable_gate_lr_${lr}
-# init_from=/data/zl/DiffEntropy/flux/results/1024_1.0_256_1.0_depth_2_4_19_38_snr_uniform_none_cfg_1.0_1.0_wo_shift_lr_1e-5_cap_redux_tiled_multi_degradation_wo_noise_wo_usm/checkpoints/0040000
+# init_from=/ceph/data-bk/zl/DiffEntropy/flux/results/1024_1.0_256_1.0_depth_2_4_19_38_snr_uniform_none_cfg_1.0_1.0_wo_shift_lr_1e-5_cap_redux_tiled_multi_degradation_wo_noise_wo_usm/checkpoints/0040000
 mkdir -p results/"$exp_name"
 
 # unset NCCL_IB_HCA
@@ -40,7 +40,7 @@ torchrun --nproc_per_node=8 --nnodes=1 --master_port 29311 train_controlnet.py \
     --lr ${lr} --grad_clip 2.0 \
     --data_parallel fsdp \
     --max_steps 1000000 \
-    --ckpt_every 500 --log_every 10 \
+    --ckpt_every 4000 --log_every 10 \
     --precision ${precision} --grad_precision fp32 \
     --global_seed 20240826 \
     --num_workers 12 \
@@ -61,7 +61,7 @@ torchrun --nproc_per_node=8 --nnodes=1 --master_port 29311 train_controlnet.py \
     --load_clip \
     --caption_dropout_prob 1.0 \
     --cond_type image \
-    --checkpointing \
+    # --checkpointing \
     # --learnable_gate \
     # --init_from ${init_from} \
     # --controlnet_snr ${controlnet_snr} \

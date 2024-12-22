@@ -167,41 +167,27 @@ class Transport:
         terms = {}
         
         if controlnet is not None:
-            x1_controlnet = controlnet_kwargs.pop("controlnet_cond")
             controlnet_snr = controlnet_kwargs.pop("controlnet_snr", None)
             if controlnet_snr is not None:
+                x1_controlnet = controlnet_kwargs.pop("controlnet_cond")
                 t_controlnet, x0_controlnet, x1_controlnet = self.sample(x1_controlnet, snr_type=controlnet_snr)
                 t_controlnet, xt_controlnet, ut_controlnet = self.path_sampler.plan(t_controlnet, x0_controlnet, x1_controlnet)
                 controlnet_out_dict = controlnet(xt_controlnet, timesteps=1 - t_controlnet, bb_timesteps=1 - t, **controlnet_kwargs)
             else:
-                controlnet_out_dict = controlnet(x1_controlnet, timesteps=None, bb_timesteps=1 - t, **controlnet_kwargs)
+                controlnet_out_dict = controlnet(xt, timesteps=None, bb_timesteps=1 - t, **controlnet_kwargs)
             model_kwargs["double_controls"] = controlnet_out_dict["double_block_feats"]
             model_kwargs["single_controls"] = controlnet_out_dict["single_block_feats"]
             
         out_dict = model(xt, timesteps=1 - t, **model_kwargs)
         model_output = -out_dict["output"]  # todo check if this is all needed
         
-        if self.model_type == ModelType.VELOCITY:
-            if isinstance(x1, (list, tuple)):
-                assert len(model_output) == len(ut) == len(x1)
-                for i in range(B):
-                    assert (
-                        model_output[i].shape == ut[i].shape == x1[i].shape
-                    ), f"{model_output[i].shape} {ut[i].shape} {x1[i].shape}"
-                terms["task_loss"] = th.stack(
-                    [((ut[i] - model_output[i]) ** 2).mean() for i in range(B)],
-                    dim=0,
-                )
-            else:
-                if "img_mask" in model_kwargs:
-                    B, L, D = model_output.shape
-                    img_mask = model_kwargs["img_mask"]
-                    mask_loss = (model_output - ut) * img_mask.unsqueeze(-1)  # [B, L, D]
-                    terms["task_loss"] = (mask_loss ** 2).sum(dim=list(range(1, ut.dim()))) / (img_mask.sum(dim=1) * D)
-                else:
-                    terms["task_loss"] = mean_flat(((model_output - ut) ** 2))
+        if "img_mask" in model_kwargs:
+            B, L, D = model_output.shape
+            img_mask = model_kwargs["img_mask"]
+            mask_loss = (model_output - ut) * img_mask.unsqueeze(-1)  # [B, L, D]
+            terms["task_loss"] = (mask_loss ** 2).sum(dim=list(range(1, ut.dim()))) / (img_mask.sum(dim=1) * D)
         else:
-            raise NotImplementedError
+            terms["task_loss"] = mean_flat(((model_output - ut) ** 2))
         terms["loss"] = terms["task_loss"]
         terms["task_loss"] = terms["task_loss"].clone().detach()
         

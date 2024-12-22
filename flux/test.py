@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 
 def main():
     # Load and convert image to tensor
-    img_path = "/data/zl/DiffEntropy/flux/demos/fighter.webp"  # Replace with your image path
+    img_path = "/ceph/data-bk/zl/DiffEntropy/flux/demos/fighter.webp"  # Replace with your image path
     image = Image.open(img_path).convert('RGB')
     to_tensor = transforms.ToTensor()
     image_tensor = to_tensor(image).unsqueeze(0)  # Add batch dimension

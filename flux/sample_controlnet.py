@@ -99,12 +99,10 @@ def main(args, rank, master_port):
         # assert train_args.model_parallel_size == args.num_gpus
         if args.ema:
             print("Loading ema model.")
-        ckpt = torch.load(
-            os.path.join(
-                args.ckpt,
-                f"consolidated{'_ema' if args.ema else ''}.{rank:02d}-of-{args.num_gpus:02d}.pth",
-            )
-        )
+        ckpt_path = os.path.join(args.ckpt, f"consolidated{'_ema' if args.ema else ''}.{rank:02d}-of-{args.num_gpus:02d}.pth")
+        if not os.path.exists(ckpt_path):
+            ckpt_path = "/ceph/data-bk/zl/DiffEntropy/flux/results/1024_1.0_256_1.0_depth_2_4_19_38_snr_uniform_none_cfg_1.0_1.0_wo_shift_lr_1e-5_cap_redux_tiled_multi_degradation_wo_noise/checkpoints/0004000/consolidated.00-of-01.pth"
+        ckpt = torch.load(ckpt_path)
         model.load_state_dict(ckpt, strict=True)
         
         ckpt = torch.load(
@@ -158,6 +156,7 @@ def main(args, rank, master_port):
             data = json.load(file)
     else:
         files = os.listdir(args.data_path)
+        files = sorted(files)
         data = []
         for file in files:
             if file.endswith(".jpg") or file.endswith(".png"):
