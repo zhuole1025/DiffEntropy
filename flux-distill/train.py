@@ -642,6 +642,8 @@ def main(args):
             
             x_real = (ae.encode(x_real.to(ae.dtype)).latent_dist.sample() - ae.config.shift_factor) * ae.config.scaling_factor
             
+            x_real = [(ae.encode(img[None].to(ae.dtype)).latent_dist.sample()[0] - ae.config.shift_factor) * ae.config.scaling_factor for img in x_real]
+            
         with torch.no_grad():
             inp_denoise = prepare(t5=t5, clip=clip, img=x_denoise, prompt=caps_denoise, proportion_empty_prompts=args.caption_dropout_prob, text_emb=text_emb_denoise)
             
