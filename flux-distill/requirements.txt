@@ -14,3 +14,4 @@ sentencepiece
 basicsr
 matplotlib
 pandas
+pyiqa

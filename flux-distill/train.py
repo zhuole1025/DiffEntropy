@@ -49,7 +49,7 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 from diffusers import AutoencoderKL
 
-from data import ItemProcessor, MyDataset, AspectRatioBatchSampler
+from data import ItemProcessor, MyDataset, AspectRatioBatchSampler, read_general
 from flux.sampling import prepare
 from flux.model import Flux, FluxParams, FluxLoraWrapper, FluxUnifiedWrapper
 from flux.util import load_ae, load_clip, load_flow_model, load_t5, configs, print_load_warning
@@ -80,8 +80,8 @@ class T2IItemProcessor(ItemProcessor):
                 with safe_open(data_item["text_embeddings_path"], framework="pt", device="cpu") as f:
                     text_emb = {k: f.get_tensor(k) for k in f.keys()}
         elif "image_path" in data_item:
-            image_path = data_item["image_path"]
-            image = Image.open(image_path).convert("RGB")
+            url = data_item["image_path"]
+            image = Image.open(read_general(url)).convert("RGB")
             text = data_item["prompt"]
         elif "image_url" in data_item:
             url = data_item["image_url"]
@@ -119,6 +119,14 @@ class T2IItemProcessor(ItemProcessor):
         else:
             raise ValueError(f"Unrecognized item: {data_item}")
 
+        if image.mode.upper() != "RGB":
+            mode = image.mode.upper()
+            if mode not in self.special_format_set:
+                self.special_format_set.add(mode)
+            if mode == "RGBA":
+                image = to_rgb_if_rgba(image)
+            else:
+                image = image.convert("RGB")
         image = self.image_transform(image)
 
         return image, text, text_emb
@@ -283,6 +291,66 @@ def accumulate_log_dict(accumulated, new_dict):
     return accumulated
 
 
+def encode_in_chunks(ae, x, chunk_size=1):
+    """Encode images in smaller chunks to avoid OOM."""
+    num_chunks = (x.shape[0] + chunk_size - 1) // chunk_size
+    latents = []
+    
+    for i in range(num_chunks):
+        start_idx = i * chunk_size
+        end_idx = min((i + 1) * chunk_size, x.shape[0])
+        chunk = x[start_idx:end_idx]
+        
+        with torch.no_grad():
+            chunk_latent = ae.encode(chunk.to(ae.dtype)).latent_dist.sample()
+            chunk_latent = (chunk_latent - ae.config.shift_factor) * ae.config.scaling_factor
+            latents.append(chunk_latent)
+            
+    return torch.cat(latents, dim=0)
+
+
+def prepare_images_for_saving(images_tensor, height, width, grid_size=4, range_type="neg1pos1"):
+    if range_type != "uint8":
+        images_tensor = (images_tensor * 0.5 + 0.5).clamp(0, 1) * 255
+
+    images = images_tensor[:grid_size*grid_size].permute(0, 2, 3, 1).detach().cpu().numpy().astype("uint8")
+    grid = images.reshape(grid_size, grid_size, height, width, 3)
+    grid = np.swapaxes(grid, 1, 2).reshape(grid_size*height, grid_size*width, 3)
+    return grid
+
+
+def draw_valued_array(data, output_dir, grid_size=4):
+    fig = plt.figure(figsize=(20,20))
+
+    data = data[:grid_size*grid_size].reshape(grid_size, grid_size)
+    cax = plt.matshow(data, cmap='viridis')  # Change cmap to your desired color map
+    plt.colorbar(cax)
+
+    for i in range(grid_size):
+        for j in range(grid_size):
+            plt.text(j, i, f'{data[i, j]:.3f}', ha='center', va='center', color='black')
+
+    plt.savefig(os.path.join(output_dir, "cache.jpg"))
+    plt.close('all')
+
+    # read the image 
+    image = imageio.imread(os.path.join(output_dir, "cache.jpg"))
+    return image
+
+
+def gather_images(tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Gathers a 4D or 2D tensor from all ranks and concatenates along dim=0.
+    """
+    world_size = dist.get_world_size()
+    # create placeholder tensors on each rank
+    tensors_gather = [torch.empty_like(tensor) for _ in range(world_size)]
+    # gather each rank's tensor into tensors_gather
+    dist.all_gather(tensors_gather, tensor)
+    # concatenate them along dim=0
+    return torch.cat(tensors_gather, dim=0)
+
+
 #############################################################################
 #                                Training Loop                              #
 #############################################################################
@@ -317,7 +385,7 @@ def main(args):
         logger.info(f"Experiment directory: {args.results_dir}")
         # Create wandb logger
         if args.use_wandb:
-            wandb.init(
+            run = wandb.init(
                 project="FLUX-distill",
                 name=args.results_dir.split("/")[-1],
                 config=args.__dict__,  # Use args.__dict__ to pass all arguments
@@ -325,6 +393,8 @@ def main(args):
                 job_type="training",
                 reinit=True,  # Allows multiple runs in the same process
             )
+            wandb_folder = run.dir
+            os.makedirs(wandb_folder, exist_ok=True)
     else:
         logger = create_logger(None)
 
@@ -563,7 +633,6 @@ def main(args):
     for train_res in args.high_res_list:
         image_transform = transforms.Compose(
             [
-                transforms.Lambda(lambda img: to_rgb_if_rgba(img)),
                 transforms.Lambda(functools.partial(var_center_crop, crop_size_dict=eval(f'ASPECT_RATIO_{train_res}'))),
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
@@ -633,23 +702,32 @@ def main(args):
         x_denoise, caps_denoise, text_emb_denoise = next(data_pack["denoising_loader_iter"])
         x_real, caps_real, text_emb_real = next(data_pack["real_loader_iter"])
         
-        x_denoise = torch.stack([img.to(device, non_blocking=True) for img in x_denoise])
-        x_real = torch.stack([img.to(device, non_blocking=True) for img in x_real])
+        try:
+            x_denoise = torch.stack([img.to(device, non_blocking=True) for img in x_denoise])
+            x_real = torch.stack([img.to(device, non_blocking=True) for img in x_real])
+            if rank == 0:
+                print(step, x_denoise.shape, x_real.shape)
+                continue
+        except RuntimeError:
+            print(f"RuntimeError at step {step}")
+            for img in x_denoise:
+                print(img.shape)
+            for img in x_real:
+                print(img.shape)
+            continue
         bsz = len(caps_denoise)
         
         with torch.no_grad():
-            x_denoise = (ae.encode(x_denoise.to(ae.dtype)).latent_dist.sample() - ae.config.shift_factor) * ae.config.scaling_factor
+            x_denoise = encode_in_chunks(ae, x_denoise)
+            x_real = encode_in_chunks(ae, x_real)
             
-            x_real = (ae.encode(x_real.to(ae.dtype)).latent_dist.sample() - ae.config.shift_factor) * ae.config.scaling_factor
-            
-            x_real = [(ae.encode(img[None].to(ae.dtype)).latent_dist.sample()[0] - ae.config.shift_factor) * ae.config.scaling_factor for img in x_real]
-            
-        with torch.no_grad():
             inp_denoise = prepare(t5=t5, clip=clip, img=x_denoise, prompt=caps_denoise, proportion_empty_prompts=args.caption_dropout_prob, text_emb=text_emb_denoise)
             
             inpt_real = prepare(t5=t5, clip=clip, img=x_real, prompt=caps_real, proportion_empty_prompts=args.caption_dropout_prob, text_emb=text_emb_real)
             
         generator_loss_item = 0.0
+        loss_dm_item = 0.0
+        gen_cls_loss_item = 0.0
         accumulated_generator_log_dict = None
         for mb_idx in range((data_pack["local_bsz"] - 1) // data_pack["micro_bsz"] + 1):
             mb_st = mb_idx * data_pack["micro_bsz"]
@@ -689,6 +767,8 @@ def main(args):
                 gen_cls_loss = generator_loss_dict["gen_cls_loss"].sum() / data_pack["local_bsz"]
                 generator_loss = loss_dm * args.dm_loss_weight + gen_cls_loss * args.gen_cls_loss_weight
                 generator_loss_item += generator_loss.item()
+                loss_dm_item += loss_dm.item()
+                gen_cls_loss_item += gen_cls_loss.item()
                 
                 with model.no_sync() if args.data_parallel in ["sdp"] and not last_mb else contextlib.nullcontext():
                     generator_loss.backward()
@@ -700,6 +780,9 @@ def main(args):
             opt_guidance.zero_grad()
         
         guidance_loss_item = 0.0
+        loss_fake_item = 0.0
+        guidance_cls_loss_item = 0.0
+        accumulated_guidance_log_dict = None
         for mb_idx in range((data_pack["local_bsz"] - 1) // data_pack["micro_bsz"] + 1):
             mb_st = mb_idx * data_pack["micro_bsz"]
             mb_ed = min((mb_idx + 1) * data_pack["micro_bsz"], data_pack["local_bsz"])
@@ -734,10 +817,14 @@ def main(args):
                     visual=visual,
                 )
                 
+            accumulated_guidance_log_dict = accumulate_log_dict(accumulated_guidance_log_dict, guidance_log_dict)
+            
             loss_fake = guidance_loss_dict["loss_fake"].sum() / data_pack["local_bsz"]
             guidance_cls_loss = guidance_loss_dict["guidance_cls_loss"].sum() / data_pack["local_bsz"]
             guidance_loss = loss_fake * args.guidance_loss_weight + guidance_cls_loss * args.guidance_cls_loss_weight
             guidance_loss_item += guidance_loss.item()
+            loss_fake_item += loss_fake.item()
+            guidance_cls_loss_item += guidance_cls_loss.item()
             
             with model.no_sync() if args.data_parallel in ["sdp"] and not last_mb else contextlib.nullcontext():
                 guidance_loss.backward()
@@ -748,33 +835,163 @@ def main(args):
         opt_guidance.zero_grad()
         
         end_time = time()
+        iter_time = end_time - start_time
+        
+        loss_dict = {**generator_loss_dict, **guidance_loss_dict}
+        log_dict = {**accumulated_generator_log_dict, **accumulated_guidance_log_dict}
+        
+        generated_image_mean = log_dict["guidance_data_dict"]["img"].mean()
+        generated_image_std = log_dict["guidance_data_dict"]["img"].std()
+        torch.distributed.all_reduce(generated_image_mean, op=torch.distributed.ReduceOp.AVG)
+        torch.distributed.all_reduce(generated_image_std, op=torch.distributed.ReduceOp.AVG)
+        
+        if COMPUTE_GENERATOR_GRADIENT:
+            dmtrain_pred_real_image_mean = log_dict['dmtrain_pred_real_image'].mean()
+            dmtrain_pred_real_image_std = log_dict['dmtrain_pred_real_image'].std() 
+            torch.distributed.all_reduce(dmtrain_pred_real_image_mean, op=torch.distributed.ReduceOp.AVG)
+            torch.distributed.all_reduce(dmtrain_pred_real_image_std, op=torch.distributed.ReduceOp.AVG)
+            
+            dmtrain_pred_fake_image_mean = log_dict['dmtrain_pred_fake_image'].mean()
+            dmtrain_pred_fake_image_std = log_dict['dmtrain_pred_fake_image'].std() 
+            torch.distributed.all_reduce(dmtrain_pred_fake_image_mean, op=torch.distributed.ReduceOp.AVG)
+            torch.distributed.all_reduce(dmtrain_pred_fake_image_std, op=torch.distributed.ReduceOp.AVG)
+        
+        original_image_mean = x_denoise.mean()
+        original_image_std = x_denoise.std()
+        torch.distributed.all_reduce(original_image_mean, op=torch.distributed.ReduceOp.AVG)
+        torch.distributed.all_reduce(original_image_std, op=torch.distributed.ReduceOp.AVG)
+        
+        if visual:
+            log_dict["dmtrain_pred_real_image_decoded"] = gather_images(log_dict["dmtrain_pred_real_image_decoded"])
+            log_dict["dmtrain_pred_fake_image_decoded"] = gather_images(log_dict["dmtrain_pred_fake_image_decoded"])
+            log_dict["generated_image"] = gather_images(log_dict["generated_image"])
+            log_dict["original_clean_image"] = gather_images(log_dict["original_clean_image"])
+            log_dict["denoising_timestep"] = gather_images(log_dict["denoising_timestep"])
         
         if args.use_wandb and rank == 0:
-            wandb.log({
-                "train/generator_loss": generator_loss_item,
-                "train/guidance_loss": guidance_loss_item,
-                "train/generator_grad_norm": generator_grad_norm,
-                "train/guidance_grad_norm": guidance_grad_norm,
-                "train/generator_lr": opt_generator.param_groups[0]["lr"],
-                "train/guidance_lr": opt_guidance.param_groups[0]["lr"],
-            }, step=step)
+            wandb_log_dict = {
+                "iter_time": iter_time,
+                "loss_fake": loss_fake_item,
+                "guidance_cls_loss": guidance_cls_loss_item,
+                "guidance_loss": guidance_loss_item,
+                "guidance_grad_norm": guidance_grad_norm,
+                "guidance_lr": opt_guidance.param_groups[0]["lr"],
+                "generated_image_mean": generated_image_mean,
+                "generated_image_std": generated_image_std,
+            }
+            
+            if COMPUTE_GENERATOR_GRADIENT:
+                wandb_log_dict.update({
+                    "generator_lr": opt_generator.param_groups[0]["lr"],
+                    "loss_dm": loss_dm_item,
+                    "gen_cls_loss": gen_cls_loss_item,
+                    "generator_loss": generator_loss_item,
+                    "generator_grad_norm": generator_grad_norm,
+                    "dmtrain_pred_real_image_mean": dmtrain_pred_real_image_mean,
+                    "dmtrain_pred_real_image_std": dmtrain_pred_real_image_std,
+                    "dmtrain_pred_fake_image_mean": dmtrain_pred_fake_image_mean,
+                    "dmtrain_pred_fake_image_std": dmtrain_pred_fake_image_std,
+                })
+            
+            wandb_log_dict.update({
+                "original_image_mean": original_image_mean,
+                "original_image_std": original_image_std,
+            })
+            
+            if visual:
+                with torch.no_grad():
+                    (
+                        dmtrain_pred_real_image, dmtrain_pred_fake_image, 
+                        dmtrain_gradient_norm
+                    ) = (
+                        log_dict['dmtrain_pred_real_image_decoded'], log_dict['dmtrain_pred_fake_image_decoded'], 
+                        log_dict['dmtrain_gradient_norm']
+                    )
+                    
+                    height = dmtrain_pred_real_image.shape[2]
+                    width = dmtrain_pred_real_image.shape[3]
+                    dmtrain_pred_real_image_grid = prepare_images_for_saving(dmtrain_pred_real_image, height=height, width=width, grid_size=args.grid_size)
+                    dmtrain_pred_fake_image_grid = prepare_images_for_saving(dmtrain_pred_fake_image, height=height, width=width, grid_size=args.grid_size)
 
+                    difference_scale_grid = draw_valued_array(
+                        (dmtrain_pred_real_image - dmtrain_pred_fake_image).abs().mean(dim=[1, 2, 3]).cpu().numpy(), 
+                        output_dir=wandb_folder, grid_size=args.grid_size
+                    )
+
+                    difference = (dmtrain_pred_real_image - dmtrain_pred_fake_image)
+                    difference = (difference - difference.min()) / (difference.max() - difference.min())
+                    difference = (difference - 0.5) / 0.5
+                    difference = prepare_images_for_saving(difference, height=height, width=width, grid_size=args.grid_size)
+
+                    wandb_log_dict.update({
+                        "dmtrain_pred_real_image": wandb.Image(dmtrain_pred_real_image_grid),
+                        "dmtrain_pred_fake_image": wandb.Image(dmtrain_pred_fake_image_grid),
+                        "difference": wandb.Image(difference),
+                        "difference_norm_grid": wandb.Image(difference_scale_grid),
+                    })
+
+                    generated_image = log_dict['generated_image']
+                    height = generated_image.shape[2]
+                    width = generated_image.shape[3]
+                    generated_image_grid = prepare_images_for_saving(generated_image, height=height, width=width, grid_size=args.grid_size)
+
+                    generated_image_mean = generated_image.mean()
+                    generated_image_std = generated_image.std()
+
+                    wandb_log_dict.update({
+                        "generated_image": wandb.Image(generated_image_grid),
+                    })
+
+                    origianl_clean_image = log_dict["original_clean_image"]
+                    origianl_clean_image_grid = prepare_images_for_saving(origianl_clean_image, height=height, width=width, grid_size=args.grid_size)
+
+                    denoising_timestep = log_dict["denoising_timestep"]
+                    denoising_timestep_grid = draw_valued_array(denoising_timestep.cpu().numpy(), output_dir=wandb_folder, grid_size=args.grid_size)
+
+                    wandb_log_dict.update(
+                        {
+                            "original_clean_image": wandb.Image(origianl_clean_image_grid),
+                            "denoising_timestep": wandb.Image(denoising_timestep_grid)
+                        }
+                    )
+
+
+                    pred_realism_on_fake = log_dict["pred_realism_on_fake"]
+                    pred_realism_on_real = log_dict["pred_realism_on_real"]
+
+                    hist_pred_realism_on_fake = draw_probability_histogram(pred_realism_on_fake.cpu().numpy())
+                    hist_pred_realism_on_real = draw_probability_histogram(pred_realism_on_real.cpu().numpy())
+
+                    wandb_log_dict.update(
+                        {
+                            "hist_pred_realism_on_fake": wandb.Image(hist_pred_realism_on_fake),
+                            "hist_pred_realism_on_real": wandb.Image(hist_pred_realism_on_real),
+                            # "real_image": wandb.Image(real_image_grid)
+                        }
+                    )
+
+
+            wandb.log(wandb_log_dict, step=step)
+                
+                
         # Log loss values:
         metrics = data_pack["metrics"]
         if COMPUTE_GENERATOR_GRADIENT:
+            metrics["loss_dm"].update(loss_dm_item)
+            metrics["gen_cls_loss"].update(gen_cls_loss_item)
             metrics["generator_loss"].update(generator_loss_item)
             metrics["generator_grad_norm"].update(generator_grad_norm)
+        metrics["loss_fake"].update(loss_fake_item)
+        metrics["guidance_cls_loss"].update(guidance_cls_loss_item)
         metrics["guidance_loss"].update(guidance_loss_item)
         metrics["guidance_grad_norm"].update(guidance_grad_norm)
-        metrics["Secs/Step"].update(end_time - start_time)
-        metrics["Imgs/Sec"].update(data_pack["global_bsz"] / (end_time - start_time))
+        metrics["Secs/Step"].update(iter_time)
+        metrics["Imgs/Sec"].update(data_pack["global_bsz"] / iter_time)
         if (step + 1) % args.log_every == 0:
             # Measure training speed:
             torch.cuda.synchronize()
             logger.info(
                 f"Res{high_res}: (step{step + 1:07d}) "
-                + f"generator_lr{opt_generator.param_groups[0]['lr']:.8f} "
-                + f"guidance_lr{opt_guidance.param_groups[0]['lr']:.8f} "
                 + " ".join([f"{key}:{str(val)}" for key, val in metrics.items()])
             )
 
