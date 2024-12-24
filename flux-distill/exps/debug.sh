@@ -4,7 +4,7 @@ export WANDB_API_KEY="75de1215548653cdc8084ae0d1450f2d84fd9a20"
 export HF_TOKEN="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"
 export HF_HOME="/ceph/data-bk/huggingface"
 
-train_data_root='configs/data/2M.yaml'
+train_data_root=configs/data/fluxpro_tag_en.yaml
 batch_size=32
 micro_batch_size=1
 generator_lr=5e-7
@@ -22,6 +22,7 @@ generator_guidance_scale=4.0
 dfake_gen_update_ratio=5
 gen_cls_loss_weight=5e-3
 guidance_cls_loss_weight=1e-2
+generator_loss_type=sim
 
 exp_name=test
 mkdir -p results/"$exp_name"
@@ -57,6 +58,7 @@ torchrun --nproc_per_node=8 --nnodes=1 --master_port 29338 train.py \
     --dfake_gen_update_ratio ${dfake_gen_update_ratio} \
     --gen_cls_loss_weight ${gen_cls_loss_weight} \
     --guidance_cls_loss_weight ${guidance_cls_loss_weight} \
+    --generator_loss_type ${generator_loss_type} \
     --checkpointing \
     --full_model \
     

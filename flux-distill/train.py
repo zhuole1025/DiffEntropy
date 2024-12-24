@@ -27,6 +27,10 @@ from huggingface_hub import hf_hub_download
 import wandb
 
 from PIL import Image
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+import imageio
 import fairscale.nn.model_parallel.initialize as fs_init
 import torch
 import torch.distributed as dist
@@ -338,6 +342,26 @@ def draw_valued_array(data, output_dir, grid_size=4):
     return image
 
 
+def draw_probability_histogram(data):
+    fig = plt.figure(figsize=(5,5))
+
+    plt.hist(data, color='blue', edgecolor='black')
+    plt.title('Histogram of Realism Prediction')
+    plt.xlabel('Value')
+    plt.ylabel('Frequency')
+    plt.xlim(0, 1)
+
+    canvas = FigureCanvasAgg(fig)
+    canvas.draw()
+
+    # Get the canvas as a PIL image
+    image = Image.frombytes(
+        "RGB", canvas.get_width_height(), canvas.tostring_rgb()
+    )
+    plt.close('all')
+    return image
+
+
 def gather_images(tensor: torch.Tensor) -> torch.Tensor:
     """
     Gathers a 4D or 2D tensor from all ranks and concatenates along dim=0.
@@ -571,14 +595,14 @@ def main(args):
 
     logger.info(f"model:\n{model}\n")
 
-    # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant
+    # Setup optimizer (we used default Adam betas=(0.9, 0.0) and a constant
     # learning rate of 1e-4 in our paper):
     opt_generator = torch.optim.AdamW([
         {'params': generator_params, 'lr': args.generator_lr, 'weight_decay': args.wd}
-    ])
+    ], betas=(0.9, 0.))
     opt_guidance = torch.optim.AdamW([
         {'params': guidance_params, 'lr': args.guidance_lr, 'weight_decay': args.wd}
-    ])
+    ], betas=(0.9, 0.))
     if args.resume:
         opt_state_world_size = len(
             [x for x in os.listdir(args.resume) if x.startswith("optimizer_generator.") and x.endswith(".pth")]
@@ -701,21 +725,13 @@ def main(args):
         
         x_denoise, caps_denoise, text_emb_denoise = next(data_pack["denoising_loader_iter"])
         x_real, caps_real, text_emb_real = next(data_pack["real_loader_iter"])
-        
         try:
             x_denoise = torch.stack([img.to(device, non_blocking=True) for img in x_denoise])
             x_real = torch.stack([img.to(device, non_blocking=True) for img in x_real])
-            if rank == 0:
-                print(step, x_denoise.shape, x_real.shape)
-                continue
+            bsz = len(caps_denoise)
         except RuntimeError:
-            print(f"RuntimeError at step {step}")
-            for img in x_denoise:
-                print(img.shape)
-            for img in x_real:
-                print(img.shape)
+            logger.info(f"RuntimeError at step {step}")
             continue
-        bsz = len(caps_denoise)
         
         with torch.no_grad():
             x_denoise = encode_in_chunks(ae, x_denoise)
@@ -821,7 +837,7 @@ def main(args):
             
             loss_fake = guidance_loss_dict["loss_fake"].sum() / data_pack["local_bsz"]
             guidance_cls_loss = guidance_loss_dict["guidance_cls_loss"].sum() / data_pack["local_bsz"]
-            guidance_loss = loss_fake * args.guidance_loss_weight + guidance_cls_loss * args.guidance_cls_loss_weight
+            guidance_loss = loss_fake * args.fake_loss_weight + guidance_cls_loss * args.guidance_cls_loss_weight
             guidance_loss_item += guidance_loss.item()
             loss_fake_item += loss_fake.item()
             guidance_cls_loss_item += guidance_cls_loss.item()
@@ -946,7 +962,7 @@ def main(args):
                     origianl_clean_image_grid = prepare_images_for_saving(origianl_clean_image, height=height, width=width, grid_size=args.grid_size)
 
                     denoising_timestep = log_dict["denoising_timestep"]
-                    denoising_timestep_grid = draw_valued_array(denoising_timestep.cpu().numpy(), output_dir=wandb_folder, grid_size=args.grid_size)
+                    denoising_timestep_grid = draw_valued_array(denoising_timestep.float().cpu().numpy(), output_dir=wandb_folder, grid_size=args.grid_size)
 
                     wandb_log_dict.update(
                         {
@@ -959,8 +975,8 @@ def main(args):
                     pred_realism_on_fake = log_dict["pred_realism_on_fake"]
                     pred_realism_on_real = log_dict["pred_realism_on_real"]
 
-                    hist_pred_realism_on_fake = draw_probability_histogram(pred_realism_on_fake.cpu().numpy())
-                    hist_pred_realism_on_real = draw_probability_histogram(pred_realism_on_real.cpu().numpy())
+                    hist_pred_realism_on_fake = draw_probability_histogram(pred_realism_on_fake.float().cpu().numpy())
+                    hist_pred_realism_on_real = draw_probability_histogram(pred_realism_on_real.float().cpu().numpy())
 
                     wandb_log_dict.update(
                         {
@@ -969,7 +985,6 @@ def main(args):
                             # "real_image": wandb.Image(real_image_grid)
                         }
                     )
-
 
             wandb.log(wandb_log_dict, step=step)
                 
@@ -1137,7 +1152,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--caption_dropout_prob",
         type=float,
-        default=0.1,
+        default=0.0,
         help="Randomly change the caption of a sample to a blank string with the given probability.",
     )
     parser.add_argument("--snr_type", type=str, default="uniform")
@@ -1160,7 +1175,7 @@ if __name__ == "__main__":
         default="0.2,0.7,0.1",
         help="Comma-separated list of probabilities for sampling high resolution images."
     )
-    parser.add_argument("--generator_loss_type", type=str, default="dmd")
+    parser.add_argument("--generator_loss_type", type=str, default="sim")
     parser.add_argument("--generator_guidance_scale", type=float, default=1.0)
     parser.add_argument("--real_guidance_scale", type=float, default=1.0)
     parser.add_argument("--fake_guidance_scale", type=float, default=1.0)
@@ -1169,7 +1184,7 @@ if __name__ == "__main__":
     parser.add_argument("--visual_every", type=int, default=100)
     parser.add_argument("--grid_size", type=int, default=2)
     parser.add_argument("--num_denoising_step", type=int, default=1)
-    parser.add_argument("--guidance_loss_weight", type=float, default=1.0)
+    parser.add_argument("--fake_loss_weight", type=float, default=1.0)
     parser.add_argument("--guidance_cls_loss_weight", type=float, default=1.0)
     parser.add_argument("--dm_loss_weight", type=float, default=1.0)
     parser.add_argument("--gen_cls_loss_weight", type=float, default=1.0)
@@ -1180,4 +1195,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
     args.high_res_list = [int(res) for res in args.high_res_list.split(",")]
     args.high_res_probs = [float(prob) for prob in args.high_res_probs.split(",")]
+    assert args.visual_every % args.dfake_gen_update_ratio == 0
     main(args)

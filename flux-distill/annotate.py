@@ -87,8 +87,8 @@ def update_json_with_aspect_ratio(input_file, output_file, max_workers=4):
         json.dump(results, f, indent=2)
 
 if __name__ == "__main__":
-    input_file = '/mnt/petrelfs/gaopeng/zl/Lumina_v2/zl_2m/2m_new_lc2_30k_768.json'
-    output_file = '/mnt/petrelfs/gaopeng/zl/Lumina_v2/zl_2m/2m_new_lc2_30k_768_aspect_ratio.json'
+    input_file = '/mnt/petrelfs/gaopeng/qinqi/lumina2/data_folder/old/flux_pro_EN_Tag.json'
+    output_file = '/mnt/petrelfs/gaopeng/zl/Lumina_v2/zl_2m/flux_pro_EN_Tag.json'
 
     # Adjust max_workers based on your CPU cores and I/O constraints
-    update_json_with_aspect_ratio(input_file, output_file, max_workers=32)
+    update_json_with_aspect_ratio(input_file, output_file, max_workers=128)

@@ -246,7 +246,7 @@ class FluxLoraWrapper(Flux):
                 
 
 class FluxUnifiedWrapper(nn.Module):
-    def __init__(self, params: FluxParams, num_discriminator_heads: int = 0, dtype: torch.dtype = torch.bfloat16, snr_type: str = "uniform", do_shift: bool = False, grid_size: int = 1, device: str = "cuda", offload_to_cpu: bool = False, vae: AutoencoderKL = None, num_denoising_step: int = 1, min_step_percent: float = 0.02, max_step_percent: float = 0.98, real_guidance_scale: float = 1.0, fake_guidance_scale: float = 1.0, generator_guidance_scale: float = 1.0, generator_loss_type: str = "dmd"):
+    def __init__(self, params: FluxParams, num_discriminator_heads: int = 0, dtype: torch.dtype = torch.bfloat16, snr_type: str = "uniform", do_shift: bool = False, grid_size: int = 1, device: str = "cuda", offload_to_cpu: bool = False, vae: AutoencoderKL = None, num_denoising_step: int = 1, min_step_percent: float = 0.02, max_step_percent: float = 0.98, real_guidance_scale: float = 1.0, fake_guidance_scale: float = 1.0, generator_guidance_scale: float = 1.0, generator_loss_type: str = "sim"):
         super().__init__()
         with torch.device(device):
             self.fake_model = Flux(params=params, num_discriminator_heads=num_discriminator_heads).to(dtype)
@@ -269,8 +269,8 @@ class FluxUnifiedWrapper(nn.Module):
         self.do_shift = do_shift
         self.num_visuals = grid_size * grid_size
         self.num_denoising_step = num_denoising_step
-        self.denoising_step_list = torch.tensor(
-            [0, 1, 1 / self.num_denoising_step],
+        self.denoising_step_list = torch.linspace(
+            0, 1, self.num_denoising_step,
             device=device
         )
         self.phuber_c = 0.03
@@ -372,7 +372,7 @@ class FluxUnifiedWrapper(nn.Module):
         p_real = (x1 - pred_real_image)
         p_fake = (x1 - pred_fake_image)
         
-        if self.generator_loss_type == "dmd":
+        if self.generator_loss_type == "di":
             grad = (p_real - p_fake) / torch.abs(p_real).mean(dim=[1, 2], keepdim=True) 
             grad = torch.nan_to_num(grad)
             loss = 0.5 * F.mse_loss(original_x1.float(), (original_x1 - grad).detach().float(), reduction="mean")
@@ -380,7 +380,7 @@ class FluxUnifiedWrapper(nn.Module):
             grad = p_real - p_fake
             grad = torch.nan_to_num(grad)
             normed_grad = torch.sqrt((grad.square().sum(dim=[1, 2], keepdim=True) + self.phuber_c ** 2))
-            loss = grad * (p_fake - original_x1) / normed_grad
+            loss = mean_flat(grad * (p_fake - original_x1) / normed_grad)
         else:
             raise NotImplementedError("Not implemented generator_loss_type %s" % self.generator_loss_type)
         
