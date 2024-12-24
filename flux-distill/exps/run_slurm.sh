@@ -1,8 +1,8 @@
 #!/usr/bin/env sh
 
-#SBATCH -p Omnilab
+#SBATCH -p Gvlab-S1-32
 #SBATCH --gres=gpu:8
-#SBATCH -n 16
+#SBATCH -n 8
 #SBATCH --ntasks-per-node 8
 #SBATCH --output slurm_output/%j.out
 #SBATCH --error slurm_output/%j.err
